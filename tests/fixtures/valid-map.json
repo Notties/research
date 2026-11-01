@@ -1,0 +1,136 @@
+{
+  "schemaVersion": 1,
+  "topic": "ทดสอบ",
+  "slug": "test-topic",
+  "createdAt": "2026-11-01T00:00:00.000Z",
+  "updatedAt": "2026-11-01T00:00:00.000Z",
+  "brief": {
+    "goal": "สร้างงาน",
+    "level": "ไม่รู้เลย",
+    "focus": "",
+    "exclude": "",
+    "depth": "quick",
+    "constraints": ""
+  },
+  "sources": {
+    "s1": {
+      "id": "s1",
+      "title": "คู่มืออย่างเป็นทางการ",
+      "url": "https://example.com/docs/official",
+      "publisher": "Example Docs",
+      "type": "official",
+      "accessedAt": "2026-11-01"
+    },
+    "s2": {
+      "id": "s2",
+      "title": "บทความอธิบายหัวข้อ",
+      "url": "https://example.org/articles/explainer",
+      "publisher": "Example News",
+      "type": "secondary",
+      "accessedAt": "2026-11-01"
+    },
+    "s3": {
+      "id": "s3",
+      "title": "กระทู้แลกเปลี่ยนประสบการณ์",
+      "url": "https://example.net/forum/thread-1",
+      "publisher": "Example Forum",
+      "type": "community",
+      "accessedAt": "2026-11-01"
+    }
+  },
+  "root": {
+    "id": "root",
+    "level": "root",
+    "title": "ทดสอบ",
+    "status": "planned",
+    "children": [
+      {
+        "id": "z-know",
+        "level": "zone",
+        "title": "เข้าใจ",
+        "children": [
+          {
+            "id": "g-know-1",
+            "level": "group",
+            "title": "ภาพรวม",
+            "status": "done",
+            "points": [
+              {
+                "text": "ข้อเท็จจริงสำคัญที่มีสองแหล่งยืนยันตรงกัน",
+                "type": "fact",
+                "key": true,
+                "cites": ["s1", "s2"]
+              },
+              {
+                "text": "ความเห็นจากชุมชนว่าควรเริ่มจากตัวอย่างเล็ก ๆ ก่อน",
+                "type": "opinion",
+                "cites": ["s3"]
+              }
+            ],
+            "confidence": "high",
+            "confidenceReason": "แหล่งทางการและบทความรองยืนยันตรงกัน",
+            "children": [
+              {
+                "id": "g-know-1-1",
+                "level": "item",
+                "title": "รายละเอียดเพิ่มเติม",
+                "status": "frontier",
+                "points": [
+                  {
+                    "text": "รายละเอียดข้อแรกที่ยังขุดต่อได้",
+                    "type": "fact",
+                    "cites": ["s1"]
+                  }
+                ],
+                "confidence": "medium",
+                "confidenceReason": "มีแหล่งทางการเพียงแหล่งเดียว",
+                "children": []
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "z-do",
+        "level": "zone",
+        "title": "ลงมือ",
+        "children": [
+          { "id": "g-do-1", "level": "group", "title": "ขั้นตอนการทำ", "status": "planned", "children": [] }
+        ]
+      },
+      {
+        "id": "z-see",
+        "level": "zone",
+        "title": "ดูของจริง",
+        "children": [
+          { "id": "g-see-1", "level": "group", "title": "ตัวอย่างจริง", "status": "planned", "children": [] }
+        ]
+      },
+      {
+        "id": "z-warn",
+        "level": "zone",
+        "title": "ระวัง",
+        "children": [
+          { "id": "g-warn-1", "level": "group", "title": "ข้อควรระวัง", "status": "planned", "children": [] }
+        ]
+      },
+      {
+        "id": "z-next",
+        "level": "zone",
+        "title": "ไปต่อ",
+        "children": [
+          { "id": "g-next-1", "level": "group", "title": "ต่อยอดต่อ", "status": "planned", "children": [] }
+        ]
+      }
+    ]
+  },
+  "readingPath": ["g-know-1"],
+  "summary": {
+    "findings": [
+      { "text": "ข้อค้นพบหลักที่มีสองแหล่งยืนยันตรงกัน", "cites": ["s1", "s2"] }
+    ],
+    "startTomorrow": ["เริ่มจากอ่านคู่มืออย่างเป็นทางการ"]
+  },
+  "queue": [],
+  "inboxOffset": 0
+}
