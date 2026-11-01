@@ -76,13 +76,17 @@ function renameWithRetry(from, to) {
 }
 
 /**
- * Stamps updatedAt on the map and writes it to <dir>/map.json. The new text goes to map.json.tmp first and is then
- * renamed over map.json, so a reader sees the old map or the new one and never half of a write.
+ * Stamps updatedAt on the map and writes it to <dir>/map.json. The new text goes to a temp file of its own,
+ * map.json.<pid>.tmp, and is then renamed over map.json, so a reader sees the old map or the new one and never half of
+ * a write. The pid keeps two processes that save at the same time from sharing a temp file: with one shared name, one
+ * process rewrites the file the other is about to rename, and map.json ends up torn.
+ * The rename makes each save atomic for readers only. A load-modify-save that overlaps another one can still lose that
+ * one's changes, so callers must serialize them (the dr.cjs command-line tool will take a lock).
  */
 function saveMap(dir, map, { now = new Date() } = {}) {
   map.updatedAt = now.toISOString();
   const file = path.join(dir, MAP_FILE);
-  const tmp = `${file}.tmp`;
+  const tmp = `${file}.${process.pid}.tmp`;
   const json = `${JSON.stringify(map, null, 2)}\n`; // serialize first: a map that cannot be serialized touches no file
   try {
     fs.writeFileSync(tmp, json);
@@ -250,19 +254,26 @@ function markChecked(map) {
 
 // ---- queue ----
 
-// Two requests are the same when they ask for the same direction on the same node with the same question.
-const requestKey = r => JSON.stringify([r.nodeId, r.direction, r.question ?? '']);
+/**
+ * The key two queue requests are compared by: node, direction and question. Requests with the same key ask for the
+ * same research, so only one of them is queued. A missing, null and empty question are the same question. The id, the
+ * time and the status are not part of the key, so a request and the queue item made from it share one. The live server
+ * imports this, so it and acceptRequests dedupe by one rule.
+ * @param {{ nodeId: string, direction: string, question?: string | null }} request
+ * @returns {string}
+ */
+const queueKey = r => JSON.stringify([r.nodeId, r.direction, r.question ?? '']);
 
 /**
- * Queues each request as a pending item, skipping any that matches an item already in the queue (or one queued a
- * moment ago in the same call). Returns the items it added.
+ * Queues each request as a pending item, skipping any whose queueKey matches an item already in the queue (or one
+ * queued a moment ago in the same call). Returns the items it added.
  * @param {Array<{ id: string, nodeId: string, direction: string, question?: string, at: string }>} requests
  */
 function acceptRequests(map, requests) {
-  const seen = new Set(map.queue.map(requestKey));
+  const seen = new Set(map.queue.map(queueKey));
   const accepted = [];
   for (const request of requests) {
-    const key = requestKey(request);
+    const key = queueKey(request);
     if (seen.has(key)) continue;
     seen.add(key);
     const item = { ...request, status: 'pending' };
@@ -306,5 +317,5 @@ function finishItem(map, itemId, { now = new Date() } = {}) {
 
 module.exports = {
   createMap, loadMap, saveMap, findNode, parentOf, walk, mergeFragment,
-  setStatus, markChecked, acceptRequests, startItem, finishItem,
+  setStatus, markChecked, queueKey, acceptRequests, startItem, finishItem,
 };

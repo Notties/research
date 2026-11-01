@@ -3,12 +3,14 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { spawnSync } = require('node:child_process');
 const S = require('../assets/shared.js');
 const { validateMap } = require('../scripts/lib/validate.cjs');
+const MAP_MODULE = path.join(__dirname, '..', 'scripts', 'lib', 'map.cjs');
 const {
   createMap, loadMap, saveMap, findNode, parentOf, walk, mergeFragment,
-  setStatus, markChecked, acceptRequests, startItem, finishItem,
-} = require('../scripts/lib/map.cjs');
+  setStatus, markChecked, queueKey, acceptRequests, startItem, finishItem,
+} = require(MAP_MODULE);
 
 // The seven tests that carry the plan's names come from the plan. The others pin what the plan only implies:
 // the atomic save, the all-or-nothing merge, URL normalization, id allocation and the queue edge cases.
@@ -92,14 +94,14 @@ test('saveMap is atomic', t => {
   const dir = tmpDir(t);
   const m = fresh();
   saveMap(dir, m, { now: new Date('2026-11-01T10:00:00Z') });
-  assert.equal(fs.existsSync(path.join(dir, 'map.json.tmp')), false);
+  assert.deepEqual(fs.readdirSync(dir), ['map.json']); // no temp file is left, whatever it was called
   assert.equal(loadMap(dir).updatedAt, '2026-11-01T10:00:00.000Z');
 });
 
-test('saveMap writes map.json.tmp completely and then renames it over map.json', t => {
+test('saveMap writes its own temp file completely and then renames it over map.json', t => {
   const dir = tmpDir(t);
   const file = path.join(dir, 'map.json');
-  const tmp = `${file}.tmp`;
+  const tmp = `${file}.${process.pid}.tmp`; // one per process, so two processes saving at once never share a temp file
   const m = fresh();
   saveMap(dir, m, { now: T0 });
   m.topic = 'หัวข้อใหม่';
@@ -113,6 +115,41 @@ test('saveMap writes map.json.tmp completely and then renames it over map.json',
   saveMap(dir, m, { now: T1 });
   assert.deepEqual(swaps.mock.calls.map(c => c.arguments), [[tmp, file]]);
   assert.equal(loadMap(dir).topic, 'หัวข้อใหม่');
+});
+
+// Another process saves a map while this process is between writing its temp file and renaming it. With one temp name
+// shared by every writer, that interleaving let the other save overwrite and then rename away this save's temp file:
+// readers saw a torn map.json and a save failed with ENOENT. A real second process is used so the pid really differs.
+const SAVE_IN_OTHER_PROCESS = `
+  const { createMap, saveMap } = require(process.argv[1]);
+  const [dir, topic] = process.argv.slice(2);
+  saveMap(dir, createMap({ topic, slug: 'test-topic', brief: { depth: 'standard' } }));
+`;
+
+test('saveMap: a save by another process in the middle of this one leaves this save\'s temp file alone', t => {
+  const dir = tmpDir(t);
+  const file = path.join(dir, 'map.json');
+  saveMap(dir, fresh(), { now: T0 });
+  const mine = fresh();
+  mine.topic = 'mine';
+  const rename = fs.renameSync;
+  let interleaved = false;
+  t.mock.method(fs, 'renameSync', (from, to) => {
+    if (!interleaved) {
+      interleaved = true;
+      const temps = fs.readdirSync(dir).filter(name => name !== 'map.json');
+      assert.equal(temps.length, 1, 'this save has written its temp file');
+      const other = spawnSync(process.execPath, ['-e', SAVE_IN_OTHER_PROCESS, MAP_MODULE, dir, 'theirs'], { encoding: 'utf8' });
+      assert.equal(other.status, 0, other.stderr);
+      assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).topic, 'theirs'); // their save went through whole
+      assert.deepEqual(fs.readdirSync(dir).filter(name => name !== 'map.json'), temps); // and left this temp file in place
+      assert.equal(JSON.parse(fs.readFileSync(path.join(dir, temps[0]), 'utf8')).topic, 'mine');
+    }
+    return rename(from, to);
+  });
+  saveMap(dir, mine, { now: T1 });
+  assert.equal(loadMap(dir).topic, 'mine'); // this save published last
+  assert.deepEqual(fs.readdirSync(dir), ['map.json']);
 });
 
 test('saveMap stamps updatedAt on the map, round-trips it and keeps the file readable', t => {
@@ -137,7 +174,7 @@ test('a save that cannot be serialized touches no file', t => {
   m.self = m; // a cycle: JSON.stringify throws
   assert.throws(() => saveMap(dir, m, { now: T1 }), TypeError);
   assert.equal(fs.readFileSync(file, 'utf8'), good);
-  assert.equal(fs.existsSync(`${file}.tmp`), false);
+  assert.deepEqual(fs.readdirSync(dir), ['map.json']);
 });
 
 test('a save whose rename fails removes the temp file and keeps the previous map.json', t => {
@@ -149,7 +186,7 @@ test('a save whose rename fails removes the temp file and keeps the previous map
   t.mock.method(fs, 'renameSync', () => { throw new Error('rename blocked'); });
   m.topic = 'หัวข้อใหม่';
   assert.throws(() => saveMap(dir, m, { now: T1 }), /rename blocked/);
-  assert.equal(fs.existsSync(`${file}.tmp`), false);
+  assert.deepEqual(fs.readdirSync(dir), ['map.json']);
   assert.equal(fs.readFileSync(file, 'utf8'), good);
 });
 
@@ -158,7 +195,6 @@ const refused = code => Object.assign(new Error(`${code}: rename refused`), { co
 
 test('saveMap retries a rename that is refused because another process has map.json open', t => {
   const dir = tmpDir(t);
-  const file = path.join(dir, 'map.json');
   const m = fresh();
   saveMap(dir, m, { now: T0 });
   const rename = fs.renameSync;
@@ -171,7 +207,7 @@ test('saveMap retries a rename that is refused because another process has map.j
   saveMap(dir, m, { now: T1 });
   assert.equal(swaps.mock.callCount(), 4);
   assert.equal(loadMap(dir).topic, 'หัวข้อใหม่');
-  assert.equal(fs.existsSync(`${file}.tmp`), false);
+  assert.deepEqual(fs.readdirSync(dir), ['map.json']);
 });
 
 test('saveMap stops retrying a refused rename, removes the temp file and keeps the previous map.json', t => {
@@ -183,7 +219,7 @@ test('saveMap stops retrying a refused rename, removes the temp file and keeps t
   const swaps = t.mock.method(fs, 'renameSync', () => { throw refused('EPERM'); });
   assert.throws(() => saveMap(dir, m, { now: T1 }), /EPERM/);
   assert.ok(swaps.mock.callCount() > 1 && swaps.mock.callCount() < 20, `${swaps.mock.callCount()} attempts`);
-  assert.equal(fs.existsSync(`${file}.tmp`), false);
+  assert.deepEqual(fs.readdirSync(dir), ['map.json']);
   assert.equal(fs.readFileSync(file, 'utf8'), good);
 });
 
@@ -193,7 +229,7 @@ test('saveMap does not retry an error that is not a busy file', t => {
   const swaps = t.mock.method(fs, 'renameSync', () => { throw refused('ENOENT'); });
   assert.throws(() => saveMap(dir, m, { now: T1 }), /ENOENT/);
   assert.equal(swaps.mock.callCount(), 1);
-  assert.equal(fs.existsSync(path.join(dir, 'map.json.tmp')), false);
+  assert.deepEqual(fs.readdirSync(dir), []); // nothing was ever saved, and the temp file is gone too
 });
 
 test('createMap, mergeFragment, finishItem and saveMap default now to the current time', t => {
@@ -646,6 +682,31 @@ test('acceptRequests skips duplicates', () => {
   assert.equal(accepted.length, 1);
 });
 
+// queueKey is the dedupe rule itself. The server imports it, so it and acceptRequests cannot drift apart.
+test('queueKey treats a missing, null and empty question alike and ignores id, time and status', () => {
+  const detail = { nodeId: 'g-know-1', direction: 'detail' };
+  assert.equal(typeof queueKey(detail), 'string');
+  assert.equal(queueKey(detail), queueKey({ ...detail, question: '' }));
+  assert.equal(queueKey(detail), queueKey({ ...detail, question: null }));
+  assert.equal(queueKey(detail), queueKey({ ...detail, question: undefined }));
+  // A request and the queue item made from it share a key, because id, time and status are not part of it.
+  assert.equal(queueKey(request()), queueKey({ ...request({ id: 'r-2', at: ISO1 }), status: 'researching' }));
+});
+
+test('queueKey changes with the node, the direction and the question', () => {
+  const asked = request({ direction: 'question', question: 'ราคาเท่าไร' });
+  const keys = [
+    asked,
+    { ...asked, question: 'ราคาเท่าไรต่อเดือน' }, // another question
+    { ...asked, question: undefined }, // no question
+    { ...asked, direction: 'detail' }, // another direction
+    { ...asked, nodeId: 'g-know-2' }, // another node
+  ].map(queueKey);
+  assert.equal(new Set(keys).size, keys.length);
+  // The fields stay apart even when they hold the ":" that separates them in the queue text form.
+  assert.notEqual(queueKey({ nodeId: 'a:b', direction: 'c' }), queueKey({ nodeId: 'a', direction: 'b:c' }));
+});
+
 // [name, requests, queue length afterwards]. The dedupe key is nodeId + direction + question, so id and time do not count.
 const dedupe = [
   ['the same request under another id and time', [request(), request({ id: 'r-2', at: ISO1 })], 1],
@@ -661,6 +722,7 @@ for (const [name, requests, length] of dedupe) {
     const m = fresh();
     acceptRequests(m, requests);
     assert.equal(m.queue.length, length);
+    assert.equal(new Set(requests.map(queueKey)).size, length, 'it skips exactly the requests that share a queueKey');
   });
 }
 
