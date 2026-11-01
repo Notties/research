@@ -56,9 +56,12 @@ function outcome(status, stdout, stderr) {
     },
   };
 }
-// Runs a command to its end. This test process waits meanwhile, so it is for commands that need nothing from it.
-function dr(args, { input, cwd } = {}) {
-  const run = spawnSync(process.execPath, [DR, ...args], { encoding: 'utf8', input, cwd, timeout: 60000, killSignal: 'SIGKILL' });
+// Runs a command to its end. This test process waits meanwhile, so it is for commands that need nothing from it. nodeArgs go to node
+// before the script (--require, say), env is added to the environment of the child.
+function dr(args, { input, cwd, nodeArgs = [], env } = {}) {
+  const run = spawnSync(process.execPath, [...nodeArgs, DR, ...args], {
+    encoding: 'utf8', input, cwd, env: { ...process.env, ...env }, timeout: 60000, killSignal: 'SIGKILL',
+  });
   assert.equal(run.error, undefined, `dr.cjs ${args[0]} did not finish: ${run.error}`);
   return outcome(run.status, run.stdout, run.stderr);
 }
@@ -172,6 +175,142 @@ const fragment = extra => ({
 });
 const mergeArgs = (w, file, parent = 'g-know-1') => ['merge', w.dir, '--parent', parent, '--fragment', file];
 
+// ---- what a test cannot make the system do ----
+//
+// Some of what dr.cjs has to get through cannot be made to happen for real: Windows answering EACCES for a port in an excluded range
+// (a system setting; this machine's only one, 50000-50059, can still be bound), a lock that is released in the last instant of the
+// wait, a delete or a rename that is refused, a lock that another command takes over. So a child is given a stub to preload (node
+// --require) that makes one call of node's own fs or net module misbehave the way the system would, in the one place and, where it
+// matters, once. Everything else, dr.cjs, the libraries and the real files, runs as it does for real. A stub is a function whose
+// source is written to a file in the test's folder and runs in the child; `env` tells it what to do. preload() gives the options for
+// dr(), drAsync() and spawnDr(). A stub cannot use anything outside itself, since only its source is taken.
+function preload(w, stub, env) {
+  const file = writeBytes(path.join(w.work, `${stub.name}.cjs`), `(${stub})();`);
+  return { nodeArgs: ['--require', file], env };
+}
+
+// Listening on the ports named in DR_TEST_REFUSE, a JSON object of port to error code, fails the way node fails: later, with an error that
+// has the code and says that it comes from listen.
+function refusePorts() {
+  const net = require('node:net');
+  const refused = JSON.parse(process.env.DR_TEST_REFUSE);
+  const listen = net.Server.prototype.listen;
+  net.Server.prototype.listen = function refusingListen(...args) {
+    const code = refused[args[0]];
+    if (code === undefined) return listen.apply(this, args);
+    const address = '127.0.0.1';
+    const err = Object.assign(new Error(`listen ${code} ${address}:${args[0]}`), { code, syscall: 'listen', address, port: args[0] });
+    process.nextTick(() => this.emit('error', err));
+    return this;
+  };
+}
+const refusing = (w, refuse) => preload(w, refusePorts, { DR_TEST_REFUSE: JSON.stringify(refuse) });
+
+// The first attempt to make the lock fails as if the lock were there, though no file is, and by the time the failure is looked at the
+// clock says that the 10 s of waiting are over: a lock released in the last instant of the wait.
+function vanishingLock() {
+  const fs = require('node:fs');
+  const write = fs.writeFileSync;
+  const now = Date.now;
+  let skew = 0;
+  let first = true;
+  Date.now = () => now() + skew;
+  fs.writeFileSync = function vanishingWrite(file, data, options) {
+    if (first && String(file).endsWith('map.json.lock') && options?.flag === 'wx') {
+      first = false;
+      skew = 11000;
+      throw Object.assign(new Error(`EEXIST: file already exists, open '${file}'`), { code: 'EEXIST', syscall: 'open', path: file });
+    }
+    return write.apply(this, arguments);
+  };
+}
+
+// Once map.json is saved, the lock file the command holds is replaced by another command's (DR_TEST_TAKEOVER is "replace") or removed
+// ("remove"): what happens to a lock that is broken as stale while its holder is still at work.
+function lockTakenOver() {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const rename = fs.renameSync;
+  fs.renameSync = function takenOverRename(from, to) {
+    const result = rename.apply(this, arguments);
+    if (path.basename(String(to)) === 'map.json') {
+      const lock = path.join(path.dirname(String(to)), 'map.json.lock');
+      if (process.env.DR_TEST_TAKEOVER === 'remove') fs.rmSync(lock, { force: true });
+      else fs.writeFileSync(lock, '99999\nanother-commands-token\n');
+    }
+    return result;
+  };
+}
+
+// Removing the lock file is refused, as Windows does for a file that something has open.
+function unremovableLock() {
+  const fs = require('node:fs');
+  const remove = fs.rmSync;
+  fs.rmSync = function unremovableRemove(file) {
+    if (String(file).endsWith('map.json.lock')) {
+      throw Object.assign(new Error(`EPERM: operation not permitted, unlink '${file}'`), { code: 'EPERM', syscall: 'unlink', path: file });
+    }
+    return remove.apply(this, arguments);
+  };
+}
+
+// The first two reads of the lock file are refused with EBUSY, as Windows can for a moment while something else has the file open.
+function flakyLockRead() {
+  const fs = require('node:fs');
+  const read = fs.readFileSync;
+  let refused = 0;
+  fs.readFileSync = function flakyRead(file) {
+    if (String(file).endsWith('map.json.lock') && refused < 2) {
+      refused += 1;
+      throw Object.assign(new Error(`EBUSY: resource busy or locked, open '${file}'`), { code: 'EBUSY', syscall: 'open', path: file });
+    }
+    return read.apply(this, arguments);
+  };
+}
+
+// Writing map.json, the rename that puts the new file in its place, is refused, as Windows does while something holds the file open.
+function unwritableMap() {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const rename = fs.renameSync;
+  fs.renameSync = function unwritableRename(from, to) {
+    if (path.basename(String(to)) === 'map.json') {
+      throw Object.assign(new Error(`EPERM: operation not permitted, rename '${from}' -> '${to}'`), { code: 'EPERM', syscall: 'rename', path: from, dest: to });
+    }
+    return rename.apply(this, arguments);
+  };
+}
+
+// Looking at map.json is refused with EACCES, the error a reserved port gives, but from stat and not from listen.
+function unstatableMap() {
+  const fs = require('node:fs');
+  const stat = fs.statSync;
+  fs.statSync = function unstatableStat(file) {
+    if (String(file).endsWith('map.json')) {
+      throw Object.assign(new Error(`EACCES: permission denied, stat '${file}'`), { code: 'EACCES', syscall: 'stat', path: file });
+    }
+    return stat.apply(this, arguments);
+  };
+}
+
+// Between a command judging the lock stale and holding the break file, another command broke the lock and took a fresh one. Here that
+// happens at the moment the break file is made, once.
+function lockRetaken() {
+  const fs = require('node:fs');
+  const write = fs.writeFileSync;
+  let done = false;
+  fs.writeFileSync = function retakingWrite(file, data, options) {
+    const result = write.apply(this, arguments);
+    if (!done && String(file).endsWith('map.json.lock.break') && options?.flag === 'wx') {
+      done = true;
+      const lock = String(file).replace(/\.break$/, '');
+      fs.rmSync(lock, { force: true });
+      write(lock, '4321\nthe-new-holders-token\n', { flag: 'wx' });
+    }
+    return result;
+  };
+}
+
 // ---- init ----
 
 test('init creates files and refuses overwrite', t => {
@@ -221,6 +360,25 @@ test('init --force starts the topic over: a new map, an empty inbox, offset 0, a
   assert.equal(bytesOf(w.dir, 'inbox.jsonl').length, 0);
   assert.ok(fs.existsSync(inFolder(w.dir, 'fragments/keep.json')));
   assert.deepEqual(dr(['accept', w.dir]).json, { accepted: [], skipped: [] }); // the old lines are gone
+});
+
+test('init --force empties the inbox before it writes map.json, so a failure in between leaves the old map and an empty inbox', t => {
+  const w = initialized(t);
+  dr(['enqueue', w.dir, '--queue', 'g-know-1:detail; g-know-2:examples']);
+  assert.equal(dr(['accept', w.dir]).json.accepted.length, 2);
+  const mapBefore = bytesOf(w.dir, 'map.json');
+  assert.ok(readMap(w.dir).inboxOffset > 0);
+
+  const run = dr(initArgs(w, ['--force']), preload(w, unwritableMap)); // map.json cannot be written, the step after the inbox
+  assert.equal(run.status, 1);
+  assert.match(run.json.error, /EPERM/);
+  assert.ok(bytesOf(w.dir, 'map.json').equals(mapBefore), 'the old map is still there');
+  assert.equal(bytesOf(w.dir, 'inbox.jsonl').length, 0, 'the old topic\'s lines are gone: a new map at offset 0 never sits beside them');
+  assert.equal(fs.existsSync(inFolder(w.dir, 'map.json.lock')), false);
+  // What is left is the old map with its offset past the end of an empty inbox, and reading starts again from the first byte then, so
+  // a request that arrives is not missed.
+  dr(['enqueue', w.dir, '--queue', 'g-know-3:detail']);
+  assert.deepEqual(dr(['accept', w.dir]).json.accepted.map(q => q.nodeId), ['g-know-3']);
 });
 
 test('init empties an inbox left in the folder even without --force, since a new map makes its lines stale', t => {
@@ -956,7 +1114,8 @@ test('serve prints server-started, serves the page, and stops by itself when idl
 test('serve moves on to the next port when the one asked for is taken', async t => {
   const w = initialized(t);
   const port = await findPorts(t, { held: 1, free: 1 });
-  const run = spawnDr(t, ['serve', w.dir, '--port', String(port), '--idle-minutes', '0.05']);
+  // 60 s of idle time, far more than the fetch below needs; the child is killed when the test ends.
+  const run = spawnDr(t, ['serve', w.dir, '--port', String(port), '--idle-minutes', '1']);
   const started = await run.next(isStarted, 'server-started');
   assert.ok(portOf(started.url) > port && portOf(started.url) <= port + 10, `${started.url} is not one of the 10 ports after ${port}`);
   assert.equal((await fetch(`${started.url}/map.json`)).status, 200, 'it serves on the port it printed');
@@ -971,34 +1130,10 @@ test('serve fails, with one error line, when none of the 11 ports is free', asyn
   assert.equal(run.stderr, '');
 });
 
-// Windows answers EACCES, not EADDRINUSE, for a port in an excluded range (Hyper-V keeps such ranges), and a test cannot make it do
-// so: an excluded range is a system setting, and this machine's only one (50000-50059, put there by an administrator) can still be
-// bound. So these tests give the child a stub to preload (node --require). It makes net.Server#listen fail on the ports named in
-// DR_TEST_REFUSE, a JSON object of port to error code, the way Node itself fails: asynchronously, with an error that has the code. The
-// rest, dr.cjs, startServer and every real socket, runs as it does for real. The function is the stub's source and runs in the child.
-function refusePorts() {
-  const net = require('node:net');
-  const refused = JSON.parse(process.env.DR_TEST_REFUSE);
-  const listen = net.Server.prototype.listen;
-  net.Server.prototype.listen = function refusingListen(...args) {
-    const code = refused[args[0]];
-    if (code === undefined) return listen.apply(this, args);
-    const address = '127.0.0.1';
-    const err = Object.assign(new Error(`listen ${code} ${address}:${args[0]}`), { code, syscall: 'listen', address, port: args[0] });
-    process.nextTick(() => this.emit('error', err));
-    return this;
-  };
-}
-// The options that give a child the stub: `refuse` maps a port to the code listening on it fails with.
-function refusing(w, refuse) {
-  const stub = writeBytes(path.join(w.work, 'refuse-ports.cjs'), `(${refusePorts})();`);
-  return { nodeArgs: ['--require', stub], env: { DR_TEST_REFUSE: JSON.stringify(refuse) } };
-}
-
 test('serve moves on past a port the system keeps for itself (EACCES) as well as past one that is in use', async t => {
   const w = initialized(t);
   const port = await findPorts(t, { held: 1, free: 3 }); // port is in use for real, and the next 3 are free
-  const run = spawnDr(t, ['serve', w.dir, '--port', String(port), '--idle-minutes', '0.05'], refusing(w, { [port + 1]: 'EACCES' }));
+  const run = spawnDr(t, ['serve', w.dir, '--port', String(port), '--idle-minutes', '1'], refusing(w, { [port + 1]: 'EACCES' }));
   const started = await run.next(isStarted, 'server-started');
   assert.ok(portOf(started.url) > port + 1 && portOf(started.url) <= port + 10, `${started.url} is not past ${port} and ${port + 1}`);
   assert.equal((await fetch(`${started.url}/map.json`)).status, 200, 'it serves on the port it printed');
@@ -1028,9 +1163,19 @@ test('serve moves on for EADDRINUSE and EACCES only: any other error of the syst
   assert.match(run.stderr, /EMFILE/, 'a failure that is no refusal keeps its stack');
 });
 
+test('serve moves on only when listening fails: an EACCES from anything else, reading map.json say, is the failure', async t => {
+  const w = initialized(t);
+  const port = await freePort();
+  // startServer looks at map.json before it listens. Here that is refused with EACCES, the code of a reserved port, but from stat.
+  const run = dr(['serve', w.dir, '--port', String(port), '--idle-minutes', '0.05'], preload(w, unstatableMap));
+  assert.equal(run.status, 1);
+  assert.match(run.json.error, /^EACCES: permission denied, stat .*map\.json/, 'the failure itself, not "all in use or reserved"');
+  assert.match(run.stderr, /EACCES[\s\S]*\n\s+at /, 'it is no refusal, so it keeps its stack');
+});
+
 test('serve with no --port starts on one of the ports 7357 to 7367', async t => {
   const w = initialized(t);
-  const run = spawnDr(t, ['serve', w.dir, '--idle-minutes', '0.05']);
+  const run = spawnDr(t, ['serve', w.dir, '--idle-minutes', '1']);
   const started = await run.next(isStarted, 'server-started');
   assert.ok(portOf(started.url) >= 7357 && portOf(started.url) <= 7367, started.url); // whichever of them is free on this machine
 });
@@ -1060,12 +1205,15 @@ test('watch prints requests then idles', async t => {
 
 test('watch reports a request that arrives while it runs', async t => {
   const w = initialized(t);
+  // The first request is in the inbox before the watch starts. Its line is the proof that the watch is up and polling, which no pause
+  // can be: only then is the second request written, so that it can reach the watch only while the watch runs.
+  const first = appendRequest(w.dir, { nodeId: 'g-know-1', direction: 'detail' });
   const run = spawnDr(t, ['watch', w.dir, '--idle-minutes', '0.5']);
-  await sleep(400);
-  const sent = appendRequest(w.dir, { nodeId: 'g-know-1', direction: 'question', question: 'ราคา: เท่าไร' });
-  const line = await run.next(l => l.type === 'expand', 'expand');
-  assert.deepEqual(line, { type: 'expand', ...sent });
-  assert.equal(run.lines.length, 1, 'no idle line yet');
+  assert.deepEqual(await run.next(l => l.id === first.id, 'the first expand'), { type: 'expand', ...first });
+
+  const second = appendRequest(w.dir, { nodeId: 'g-know-1', direction: 'question', question: 'ราคา: เท่าไร' });
+  assert.deepEqual(await run.next(l => l.id === second.id, 'the second expand'), { type: 'expand', ...second });
+  assert.deepEqual(run.lines.map(l => l.id), [first.id, second.id], 'two lines, in order, and no idle line yet');
 });
 
 test('watch starts from map.inboxOffset: what accept took is not reported again', async t => {
@@ -1136,9 +1284,17 @@ test('the commands that write a topic take the lock, and the others do not', asy
   const lock = inFolder(w.dir, 'map.json.lock');
   fs.writeFileSync(lock, 'held\n');
 
-  // validate and enqueue, like check-urls, serve and watch, read or append only: they do not wait.
+  // The others read or only append, and none of them waits for the lock. validate, enqueue and check-urls (the map has no sources, so no
+  // network) finish at once. watch and serve go on running, so what shows that they were not held up is their first line: the request
+  // that was just enqueued, and the address of the server.
   assert.equal(dr(['validate', w.dir]).status, 0);
   assert.equal(dr(['enqueue', w.dir, '--queue', 'g-know-2:detail']).status, 0);
+  assert.deepEqual(dr(['check-urls', w.dir]).json, { ok: true, checked: 0 });
+  const watching = spawnDr(t, ['watch', w.dir, '--idle-minutes', '1']);
+  assert.equal((await watching.next(l => l.type === 'expand', 'watch: an expand line')).nodeId, 'g-know-2');
+  const serving = spawnDr(t, ['serve', w.dir, '--port', String(await freePort()), '--idle-minutes', '1']);
+  await serving.next(isStarted, 'serve: server-started');
+  assert.ok(fs.existsSync(lock), 'the lock was held all the time');
 
   const writers = {
     init: initArgs(w, ['--force']),
@@ -1167,13 +1323,106 @@ test('the commands that write a topic take the lock, and the others do not', asy
 
 test('a lock older than 30 seconds is broken', t => {
   const w = initialized(t);
-  const lock = inFolder(w.dir, 'map.json.lock');
-  fs.writeFileSync(lock, '4242\n');
-  const old = new Date(Date.now() - 31000);
-  fs.utimesSync(lock, old, old);
+  makeStale(inFolder(w.dir, 'map.json.lock'), '4242\n');
   const run = dr(['mark-checked', w.dir]);
   assert.equal(run.status, 0, run.stdout + run.stderr);
   assert.deepEqual(listing(w.dir), TOPIC_FILES);
+});
+
+// Back-dates a file by 31 s, so that the lock rules take it for stale (older than 30 s).
+function makeStale(file, text) {
+  fs.writeFileSync(file, text);
+  const old = new Date(Date.now() - 31000);
+  fs.utimesSync(file, old, old);
+}
+
+test('a break file older than 30 seconds is itself broken, so that a crash while breaking a lock blocks nothing', t => {
+  const w = initialized(t);
+  makeStale(inFolder(w.dir, 'map.json.lock'), '4242\n');
+  makeStale(inFolder(w.dir, 'map.json.lock.break'), '4243\n');
+  const run = dr(['mark-checked', w.dir]);
+  assert.equal(run.status, 0, run.stdout + run.stderr);
+  assert.deepEqual(listing(w.dir), TOPIC_FILES, 'neither file is left');
+});
+
+test('a stale lock is broken only by the command that holds the break file, and not while another one does', async t => {
+  const w = initialized(t);
+  const lock = inFolder(w.dir, 'map.json.lock');
+  const breaking = inFolder(w.dir, 'map.json.lock.break');
+  makeStale(lock, '4242\n');
+  fs.writeFileSync(breaking, '5151\n'); // another command is breaking that lock right now
+  let settled = false;
+  const run = drAsync(['mark-checked', w.dir]).finally(() => { settled = true; });
+  await sleep(700); // far more than a child needs to start: it is retrying now
+  assert.equal(settled, false, 'it went on while another command was breaking the lock');
+  assert.equal(fs.readFileSync(lock, 'utf8'), '4242\n', 'the stale lock is not its to remove');
+  fs.rmSync(breaking); // the other command is done, and has left the lock as it was
+  const result = await run;
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.deepEqual(listing(w.dir), TOPIC_FILES);
+});
+
+test('a command that holds the break file and finds a fresh lock in place of the stale one it judged leaves that lock alone', async t => {
+  const w = initialized(t);
+  const lock = inFolder(w.dir, 'map.json.lock');
+  makeStale(lock, '4242\n');
+  // The stub swaps the stale lock for a fresh one as the break file is made: another command broke it and took a new one in between.
+  let settled = false;
+  const run = drAsync(['mark-checked', w.dir], preload(w, lockRetaken)).finally(() => { settled = true; });
+  await sleep(700);
+  assert.equal(settled, false, 'it went on, so it removed a lock that was not the one it judged');
+  assert.equal(fs.readFileSync(lock, 'utf8'), '4321\nthe-new-holders-token\n', 'the fresh lock of the other command is still there');
+  fs.rmSync(lock); // the other command is done
+  const result = await run;
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.deepEqual(listing(w.dir), TOPIC_FILES);
+});
+
+test('a command whose lock was taken over or removed while it worked leaves the other lock alone, says so, and still ends well', t => {
+  const w = initialized(t);
+  const lock = inFolder(w.dir, 'map.json.lock');
+  const taken = dr(['mark-checked', w.dir], preload(w, lockTakenOver, { DR_TEST_TAKEOVER: 'replace' }));
+  assert.equal(taken.status, 0, taken.stdout + taken.stderr); // the work was done, so its result is told
+  assert.deepEqual(taken.json, { changed: 0 });
+  assert.match(taken.stderr, /^dr\.cjs: warning: map\.json\.lock was taken over while this command held it/);
+  assert.equal(fs.readFileSync(lock, 'utf8'), '99999\nanother-commands-token\n', 'the lock of the other command is untouched');
+  assert.deepEqual(validateMap(readMap(w.dir)), { ok: true, errors: [] });
+  fs.rmSync(lock);
+
+  const gone = dr(['mark-checked', w.dir], preload(w, lockTakenOver, { DR_TEST_TAKEOVER: 'remove' }));
+  assert.equal(gone.status, 0, gone.stdout + gone.stderr);
+  assert.deepEqual(gone.json, { changed: 0 });
+  assert.match(gone.stderr, /^dr\.cjs: warning: map\.json\.lock was removed while this command held it/);
+  assert.equal(fs.existsSync(lock), false);
+});
+
+test('a lock that is released in the last instant of the wait is taken, not reported as an error', t => {
+  const w = initialized(t);
+  const run = dr(['mark-checked', w.dir], preload(w, vanishingLock));
+  assert.equal(run.status, 0, run.stdout + run.stderr);
+  assert.deepEqual(run.json, { changed: 0 });
+  assert.equal(run.stderr, '');
+  assert.deepEqual(listing(w.dir), TOPIC_FILES);
+});
+
+test('a lock whose read is refused for a moment is still released, so that it does not block the next command', t => {
+  const w = initialized(t);
+  const run = dr(['mark-checked', w.dir], preload(w, flakyLockRead));
+  assert.equal(run.status, 0, run.stdout + run.stderr);
+  assert.deepEqual(run.json, { changed: 0 });
+  assert.equal(run.stderr, '', 'no warning: the read was tried again');
+  assert.deepEqual(listing(w.dir), TOPIC_FILES, 'the lock is gone');
+});
+
+test('a lock that cannot be removed does not turn a command that finished into a failure', t => {
+  const w = initialized(t);
+  const file = writeJson(path.join(w.work, 'fragment.json'), fragment());
+  const run = dr(mergeArgs(w, file), preload(w, unremovableLock));
+  assert.equal(run.status, 0, run.stdout + run.stderr);
+  assert.deepEqual(run.json, { added: ['g-know-1-1', 'g-know-1-2'] }); // told, so that nobody merges the fragment a second time
+  assert.match(run.stderr, /^dr\.cjs: warning: could not remove map\.json\.lock \(EPERM\)/);
+  assert.equal(findNode(readMap(w.dir), 'g-know-1').children.length, 2, 'the fragment was saved once');
+  assert.ok(fs.existsSync(inFolder(w.dir, 'map.json.lock')), 'it is the lock that stayed');
 });
 
 test('a command gives up on a lock that stays held for 10 seconds, names its holder, and leaves the lock alone', async t => {
@@ -1210,7 +1459,7 @@ test('parallel merges lose no update', async t => {
 // ---- the contract of every command ----
 
 test('every failure is one {"error"} line on stdout and exit 1, with no stack trace', t => {
-  const nowhere = path.join(os.tmpdir(), 'dr-cli-nowhere');
+  const nowhere = path.join(workspace(t).work, 'nowhere'); // a folder of this test's own, so nothing outside it can make it exist
   const cases = [
     [[], /^no command given \(use one of: init, /],
     [['bogus'], /^unknown command "bogus" \(use one of: init, /],

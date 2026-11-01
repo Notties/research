@@ -127,16 +127,18 @@ test('checkUrls takes the sources of a map, keyed by id, as well as a list', asy
 test('checkUrls checks at most 5 addresses at a time, and does check 5 together', async t => {
   let inFlight = 0;
   let mostInFlight = 0;
+  // Each request is held for a second, so that all 5 of the first are in flight together even on a loaded machine: they only have to
+  // reach the server within that second. 6 addresses are enough to show the limit, since the 6th has to wait for one of the 5.
   const base = await serve(t, (req, res) => {
     inFlight += 1;
     mostInFlight = Math.max(mostInFlight, inFlight);
     setTimeout(() => {
       inFlight -= 1;
       answer(res, 200);
-    }, 150);
+    }, 1000);
   });
-  const results = await checkUrls(Array.from({ length: 12 }, (_, i) => source(`s${i}`, `${base}/${i}`)));
-  assert.equal(results.length, 12);
+  const results = await checkUrls(Array.from({ length: 6 }, (_, i) => source(`s${i}`, `${base}/${i}`)));
+  assert.equal(results.length, 6);
   assert.ok(results.every(r => r.ok), 'every page answered 200');
   assert.equal(mostInFlight, 5);
 });

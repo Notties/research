@@ -26,6 +26,7 @@
 // I/O failure also writes its stack to stderr, which SKILL.md shows when serve or watch ends with a non-zero exit.
 // Ending: nothing here calls process.exit. A command sets process.exitCode and lets the event loop drain, because stdout may be
 // a pipe and Monitor, which reads that pipe, must get every line before the process goes.
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const S = require('../assets/shared.js');
@@ -180,40 +181,118 @@ const LOCK_STALE_MS = 30000;
 // Why a lock cannot be taken right now: it exists (EEXIST), or Windows is in the middle of deleting it (EPERM, EACCES, EBUSY).
 const LOCK_BUSY = ['EEXIST', 'EPERM', 'EACCES', 'EBUSY'];
 const pause = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); // a synchronous sleep
+const warn = text => process.stderr.write(`dr.cjs: warning: ${text}\n`);
 
-// How old the lock file is. A lock that is gone counts as new: the next try finds out.
-function lockAgeMs(lock) {
+// What a lock file, or a break file, is like now: how old it is, and a mark that tells it from another file in its place (which file it is
+// and when it was last written). null when there is none.
+function lockStat(file) {
   try {
-    return Date.now() - fs.statSync(lock).mtimeMs;
+    const stat = fs.statSync(file, { bigint: true });
+    return { age: Date.now() - Number(stat.mtimeMs), mark: `${stat.ino}:${stat.mtimeNs}` };
   } catch {
-    return 0;
+    return null;
   }
 }
 
 /**
- * Runs `work` while this process holds <dir>/map.json.lock. The lock is a file made with the flag "wx", which fails when the
- * file exists, so only one process at a time can make it. A process that finds it taken tries again every 50 ms for up to 10 s,
- * and a lock older than 30 s is one a crashed command left behind: it is broken. The lock is released when `work` ends, however
- * it ends. All of this is synchronous, so nothing else in this process runs while the lock is held.
+ * Takes a stale lock, one older than LOCK_STALE_MS that a crashed command left behind, out of the way. Several commands can find the same
+ * stale lock at once, and if each simply removed it, the second would remove the fresh lock that the first had taken in the meantime, and
+ * both would write. So the breaking is itself serialized, with a second file made the same way as the lock, <lock>.break: only the
+ * command that holds it may remove the lock, and only after looking again, so that the file it removes is the one it judged stale and
+ * is still stale. A break file that a crashed command left is stale by the same rule.
+ * @returns {boolean} true when the caller should try to take the lock at once: it was removed here, or it was gone, or another command
+ *   replaced it while this one was getting the break file (the try then fails, which costs nothing). false when it is not this
+ *   command's to break now: another command is breaking it, or the lock is not stale
+ */
+function breakStaleLock(lock) {
+  const judged = lockStat(lock);
+  if (judged === null) return true;
+  if (judged.age <= LOCK_STALE_MS) return false;
+  const breaking = `${lock}.break`;
+  try {
+    fs.writeFileSync(breaking, `${process.pid}\n`, { flag: 'wx' });
+  } catch (err) {
+    if (!LOCK_BUSY.includes(err.code)) throw err;
+    if ((lockStat(breaking)?.age ?? 0) > LOCK_STALE_MS) {
+      try { fs.rmSync(breaking, { force: true }); } catch { /* the next try finds it again */ }
+    }
+    return false;
+  }
+  try {
+    const now = lockStat(lock);
+    if (now !== null && now.mark === judged.mark && now.age > LOCK_STALE_MS) fs.rmSync(lock, { force: true });
+  } finally {
+    try { fs.rmSync(breaking, { force: true }); } catch { /* a break file that stays is stale after 30 s */ }
+  }
+  return true;
+}
+
+// The text of the lock file, or null when there is none. Windows can refuse a read for a moment (what the removal below is also given
+// retries for), and a lock that is not released blocks the next command, so a refusal is tried again a few times.
+function readLock(lock) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return fs.readFileSync(lock, 'utf8');
+    } catch (err) {
+      if (err.code === 'ENOENT') return null;
+      if (attempt === 5 || !LOCK_BUSY.includes(err.code)) throw err;
+      pause(20);
+    }
+  }
+}
+
+// Removes the lock when it is still this command's, the one whose second line is `token`, and tells on stderr when it is not: a lock that
+// is older than 30 s may have been broken, and the next command may have taken a new one, which this command must not remove. It never
+// throws: by now the command has done its work (a merge has saved its fragment), and a retry of work that is done would do it twice.
+function releaseLock(lock, token) {
+  try {
+    const text = readLock(lock);
+    if (text === null) {
+      warn(`${LOCK_FILE} was removed while this command held it, since a lock is broken after ${LOCK_STALE_MS / 1000} s; `
+        + 'a command that ran meanwhile may have overwritten what this one saved');
+    } else if (text.split('\n')[1] !== token) {
+      warn(`${LOCK_FILE} was taken over while this command held it, since a lock is broken after ${LOCK_STALE_MS / 1000} s, `
+        + 'so it was left alone; what this command saved may have been overwritten');
+    } else {
+      fs.rmSync(lock, { force: true, maxRetries: 5, retryDelay: 20 });
+    }
+  } catch (err) {
+    warn(`could not remove ${LOCK_FILE} (${err.code ?? err.message}); the next command waits for it, for at most ${LOCK_STALE_MS / 1000} s`);
+  }
+}
+
+/**
+ * Runs `work` while this process holds <dir>/map.json.lock. The lock is a file made with the flag "wx", which fails when the file exists,
+ * so only one process at a time can make it. It holds the pid of its holder, and a random token that only the holder knows. A process
+ * that finds it taken tries again every 50 ms for up to 10 s, and a lock older than 30 s is one a crashed command left behind: it is
+ * broken (breakStaleLock). The lock is released when `work` ends, however it ends, if it still holds this process's token. All of this
+ * is synchronous, so nothing else in this process runs while the lock is held.
  */
 function withLock(dir, work) {
   const lock = path.join(dir, LOCK_FILE);
+  const token = crypto.randomBytes(12).toString('hex');
   const giveUp = Date.now() + LOCK_WAIT_MS;
+  let lastChance = true;
   for (;;) {
     try {
-      fs.writeFileSync(lock, `${process.pid}\n`, { flag: 'wx' });
+      fs.writeFileSync(lock, `${process.pid}\n${token}\n`, { flag: 'wx' });
       break;
     } catch (err) {
       if (err.code === 'ENOENT' || err.code === 'ENOTDIR') throw new CliError(`no map.json in ${dir}`);
       if (!LOCK_BUSY.includes(err.code)) throw err;
-      if (lockAgeMs(lock) > LOCK_STALE_MS) {
-        fs.rmSync(lock, { force: true });
-        continue;
-      }
+      if ((lockStat(lock)?.age ?? 0) > LOCK_STALE_MS && breakStaleLock(lock)) continue;
       if (Date.now() >= giveUp) {
-        if (!fs.existsSync(lock)) throw err; // nobody holds a lock: the folder is the problem (a permission, say), and err says how
+        if (!fs.existsSync(lock)) {
+          // The lock was there when it was tried and is gone now: released in the last instant. That is no reason to give up, so one more
+          // try. Another error with no lock there is the folder's (a permission, say), and err says how.
+          if (err.code === 'EEXIST' && lastChance) {
+            lastChance = false;
+            continue;
+          }
+          throw err;
+        }
         let holder = '';
-        try { holder = ` (pid ${fs.readFileSync(lock, 'utf8').trim()})`; } catch { /* it was released at this moment */ }
+        try { holder = ` (pid ${fs.readFileSync(lock, 'utf8').split('\n')[0].trim()})`; } catch { /* it was released at this moment */ }
         throw new CliError(
           `${LOCK_FILE} in ${dir} is held by another dr.cjs command${holder} and did not come free in ${LOCK_WAIT_MS / 1000} s; `
           + `try again shortly: a lock that a crashed command left behind is broken after ${LOCK_STALE_MS / 1000} s`,
@@ -225,7 +304,7 @@ function withLock(dir, work) {
   try {
     return work();
   } finally {
-    fs.rmSync(lock, { force: true, maxRetries: 5, retryDelay: 20 });
+    releaseLock(lock, token);
   }
 }
 
@@ -282,9 +361,12 @@ define(
       if (!force && fs.existsSync(path.join(dir, MAP_FILE))) {
         throw new CliError(`map.json already exists in ${dir}; pass --force to start the topic over (that also empties inbox.jsonl)`);
       }
+      // The inbox first. A crash between the two writes then leaves the old map with an offset past the end of an empty inbox, which
+      // readRequests reads again from the first byte. The other way round it would leave a new map at offset 0 next to the old topic's
+      // lines, and the next accept would take them for new.
+      fs.writeFileSync(path.join(dir, INBOX_FILE), '');
       saveMap(dir, map);
       writeIndexHtml(dir, map, { live: false });
-      fs.writeFileSync(path.join(dir, INBOX_FILE), ''); // a new map at offset 0 would take every old inbox line for new
     });
     return { dir };
   },
@@ -455,7 +537,8 @@ define(
 let shutdown = () => {}; // what a command that keeps running must undo for the process to end after a failure
 
 // Why a port cannot be had, and the next one may be: it is in use (EADDRINUSE), or the system keeps it for itself (EACCES: Windows
-// answers it for a port in an excluded range, such as one Hyper-V keeps, and Linux for a port below 1024 to anyone but root).
+// answers it for a port in an excluded range, such as one Hyper-V keeps, and Linux for a port below 1024 to anyone but root). Only when
+// the error comes from listen: startServer also reads map.json before it listens, and an EACCES from that is not a port's.
 const PORT_UNAVAILABLE = ['EADDRINUSE', 'EACCES'];
 
 // Starts the live server on the first usable port from `port` on: that port and the 10 after it, moving on only for a port that is
@@ -468,7 +551,7 @@ async function startOnFreePort(dir, port, idleMs) {
     try {
       return await startServer({ dir, port: candidate, idleMs });
     } catch (err) {
-      if (PORT_UNAVAILABLE.includes(err.code)) continue;
+      if (PORT_UNAVAILABLE.includes(err.code) && err.syscall === 'listen') continue;
       if (err instanceof RangeError) throw new CliError(err.message);
       throw err;
     }
