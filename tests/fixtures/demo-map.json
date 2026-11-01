@@ -1,0 +1,635 @@
+{
+  "schemaVersion": 1,
+  "topic": "ทำเว็บ 3D ระดับ Awwwards",
+  "slug": "awwwards-3d-web",
+  "createdAt": "2026-11-01T08:00:00.000Z",
+  "updatedAt": "2026-11-01T10:30:00.000Z",
+  "brief": {
+    "goal": "สร้างงาน",
+    "level": "ไม่รู้เลย",
+    "focus": "เครื่องมือและขั้นตอนการทำ",
+    "exclude": "",
+    "depth": "standard",
+    "constraints": "ทำคนเดียว"
+  },
+  "sources": {
+    "s1": {
+      "id": "s1",
+      "title": "three.js docs",
+      "url": "https://threejs.org/docs/",
+      "publisher": "three.js",
+      "type": "official",
+      "accessedAt": "2026-11-01"
+    },
+    "s2": {
+      "id": "s2",
+      "title": "ScrollTrigger",
+      "url": "https://gsap.com/docs/v3/Plugins/ScrollTrigger/",
+      "publisher": "GSAP",
+      "type": "official",
+      "accessedAt": "2026-11-01"
+    },
+    "s3": {
+      "id": "s3",
+      "title": "Web Vitals",
+      "url": "https://web.dev/articles/vitals",
+      "publisher": "web.dev",
+      "type": "official",
+      "publishedAt": "2020-05-04",
+      "accessedAt": "2026-11-01"
+    },
+    "s4": {
+      "id": "s4",
+      "title": "Awwwards evaluation system",
+      "url": "https://www.awwwards.com/about-evaluation/",
+      "publisher": "Awwwards",
+      "type": "primary",
+      "accessedAt": "2026-11-01"
+    },
+    "s5": {
+      "id": "s5",
+      "title": "WebGL API",
+      "url": "https://developer.mozilla.org/en-US/docs/Web/API/WebGL_API",
+      "publisher": "MDN Web Docs",
+      "type": "secondary",
+      "accessedAt": "2026-11-01"
+    },
+    "s6": {
+      "id": "s6",
+      "title": "WebGPU API",
+      "url": "https://developer.mozilla.org/en-US/docs/Web/API/WebGPU_API",
+      "publisher": "MDN Web Docs",
+      "type": "secondary",
+      "accessedAt": "2026-11-01"
+    },
+    "s7": {
+      "id": "s7",
+      "title": "three.js forum",
+      "url": "https://discourse.threejs.org/",
+      "publisher": "three.js community",
+      "type": "community",
+      "accessedAt": "2026-11-01"
+    },
+    "s8": {
+      "id": "s8",
+      "title": "Three.js in 100 Seconds",
+      "url": "https://www.youtube.com/@Fireship",
+      "publisher": "Fireship (YouTube)",
+      "type": "video",
+      "publishedAt": "2022-09-12",
+      "accessedAt": "2026-11-01"
+    }
+  },
+  "root": {
+    "id": "root",
+    "level": "root",
+    "title": "ทำเว็บ 3D ระดับ Awwwards",
+    "status": "done",
+    "summary": "เว็บ 3D ที่ได้รางวัลส่วนใหญ่ใช้ Three.js คู่กับ GSAP แต่ตัดสินกันที่ดีไซน์และการใช้งาน ไม่ใช่ปริมาณ 3D",
+    "children": [
+      {
+        "id": "z-know",
+        "level": "zone",
+        "title": "เข้าใจ",
+        "summary": "เรื่องนี้คืออะไร ศัพท์ที่ต้องรู้ และรากฐานที่ทุกอย่างต่อยอดจากมัน",
+        "children": [
+          {
+            "id": "g-know-1",
+            "level": "group",
+            "title": "ภาพรวม",
+            "status": "done",
+            "summary": "ภาพใหญ่ของงานเว็บ 3D ระดับรางวัล ก่อนลงรายละเอียด",
+            "researchedAt": "2026-11-01T09:00:00.000Z",
+            "children": [
+              {
+                "id": "g-know-1-1",
+                "level": "item",
+                "title": "เว็บ 3D ระดับรางวัลคืออะไร",
+                "status": "frontier",
+                "summary": "เว็บที่เล่าเรื่องผ่านภาพ 3D และการเคลื่อนไหว โดยยังใช้งานง่ายและโหลดเร็ว",
+                "why": "ช่วยตั้งเป้าให้ถูกตั้งแต่แรก ว่ากรรมการดูอะไร",
+                "points": [
+                  { "text": "Awwwards ให้คะแนน 4 ด้าน คือ Design, Usability, Creativity และ Content", "type": "fact", "cites": ["s4"] },
+                  { "text": "ผลงานส่วนใหญ่มาจากทีมที่มีทั้งดีไซเนอร์และ creative developer", "type": "opinion", "cites": ["s7"] }
+                ],
+                "confidence": "medium",
+                "confidenceReason": "เกณฑ์มาจากเว็บ Awwwards โดยตรง แต่เรื่องทีมมาจากชุมชนแหล่งเดียว",
+                "related": ["g-see-3-1"],
+                "researchedAt": "2026-11-01T09:00:00.000Z"
+              }
+            ]
+          },
+          {
+            "id": "g-know-2",
+            "level": "group",
+            "title": "ศัพท์ที่ต้องรู้",
+            "status": "done",
+            "summary": "คำที่จะเจอบ่อยตลอดผลรีเสิร์ชนี้",
+            "researchedAt": "2026-11-01T09:00:00.000Z",
+            "children": [
+              {
+                "id": "g-know-2-1",
+                "level": "item",
+                "title": "WebGL",
+                "status": "frontier",
+                "summary": "มาตรฐานที่ให้เบราว์เซอร์วาดกราฟิก 3D ด้วยการ์ดจอ",
+                "points": [
+                  { "text": "WebGL วาดลงบน element <canvas> โดยใช้การ์ดจอ", "type": "fact", "cites": ["s5", "s1"] }
+                ],
+                "confidence": "high",
+                "confidenceReason": "เอกสาร MDN และ three.js ตรงกัน",
+                "researchedAt": "2026-11-01T09:00:00.000Z"
+              },
+              {
+                "id": "g-know-2-2",
+                "level": "item",
+                "title": "Shader",
+                "status": "frontier",
+                "summary": "โปรแกรมเล็กๆ ที่รันบนการ์ดจอ ใช้กำหนดตำแหน่งและสีของทุกพิกเซล",
+                "points": [
+                  { "text": "vertex shader จัดตำแหน่งจุด ส่วน fragment shader ระบายสีทีละพิกเซล", "type": "fact", "cites": ["s5"] }
+                ],
+                "confidence": "medium",
+                "confidenceReason": "มีเอกสารอ้างอิงแหล่งเดียว",
+                "researchedAt": "2026-11-01T09:00:00.000Z"
+              }
+            ]
+          },
+          {
+            "id": "g-know-3",
+            "level": "group",
+            "title": "รากฐาน",
+            "status": "done",
+            "summary": "ความรู้พื้นฐานที่ทุกอย่างต่อยอดจากมัน ถ้าเข้าใจส่วนนี้ จะหยิบเครื่องมือไหนมาใช้ก็ได้",
+            "researchedAt": "2026-11-01T09:00:00.000Z",
+            "children": [
+              {
+                "id": "g-know-3-1",
+                "level": "item",
+                "title": "เบราว์เซอร์วาดหน้าเว็บยังไง",
+                "status": "frontier",
+                "summary": "ทุกเฟรมเบราว์เซอร์ทำงานเป็นขั้น Layout, Paint และ Composite ถ้าทำไม่ทันในราว 16ms ภาพจะกระตุก",
+                "why": "เป็นเหตุผลว่าทำไมบางแอนิเมชันลื่น บางอันกระตุก",
+                "forYou": "คุณเริ่มจากศูนย์และจะทำคนเดียว ให้เข้าใจเรื่องนี้ก่อนเลือกเครื่องมือ เพราะเป็นต้นเหตุของปัญหาความลื่นเกือบทั้งหมด",
+                "points": [
+                  { "text": "60fps หมายถึงมีเวลาราว 16ms ต่อเฟรม", "type": "fact", "key": true, "cites": ["s3", "s8"] },
+                  { "text": "แอนิเมชันที่ลื่นที่สุดคือขยับแค่ transform กับ opacity", "type": "fact", "cites": ["s3"] }
+                ],
+                "confidence": "high",
+                "confidenceReason": "แหล่งทางการและวิดีโออธิบายตรงกัน",
+                "researchedAt": "2026-11-01T09:00:00.000Z"
+              },
+              {
+                "id": "g-know-3-2",
+                "level": "item",
+                "title": "GPU และ WebGL ทำงานยังไง",
+                "status": "frontier",
+                "summary": "การ์ดจอวาดทุกอย่างเป็นสามเหลี่ยม ผ่านโปรแกรมเล็กๆ ที่เรียกว่า shader",
+                "points": [
+                  { "text": "ยิ่งสั่งวาด (draw call) น้อยครั้ง ยิ่งเร็ว", "type": "fact", "cites": ["s1", "s7"] }
+                ],
+                "confidence": "high",
+                "confidenceReason": "เอกสารทางการและชุมชนเห็นตรงกัน",
+                "researchedAt": "2026-11-01T09:00:00.000Z"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "z-do",
+        "level": "zone",
+        "title": "ลงมือ",
+        "summary": "ทำยังไง ต้องมีอะไร ต้องใช้ทักษะไหน เลือกเครื่องมือยังไง และเทคนิคที่ใช้",
+        "children": [
+          {
+            "id": "g-do-1",
+            "level": "group",
+            "title": "ขั้นตอนการทำ",
+            "status": "planned",
+            "summary": "จะรีเสิร์ชว่างานจริงเดินตามลำดับไหน",
+            "children": []
+          },
+          {
+            "id": "g-do-2",
+            "level": "group",
+            "title": "สิ่งที่ต้องมี",
+            "status": "done",
+            "summary": "ชุดเครื่องมือที่เว็บกลุ่มนี้ใช้มากที่สุด",
+            "researchedAt": "2026-11-01T09:00:00.000Z",
+            "children": [
+              {
+                "id": "g-do-2-1",
+                "level": "item",
+                "title": "Three.js",
+                "logo": "threedotjs",
+                "status": "frontier",
+                "summary": "ไลบรารี 3D บนเว็บ ครบทั้งโหลดโมเดล แสง เงา และ post-processing",
+                "points": [
+                  { "text": "เว็บตัวอย่างที่แกะมาส่วนใหญ่ใช้ Three.js หรือ React Three Fiber ที่สร้างบน Three.js", "type": "estimate", "key": true, "singleSource": true, "cites": ["s7"] },
+                  { "text": "มีตัวโหลดโมเดล glTF (GLTFLoader) ในชุดตัวอย่างของไลบรารี", "type": "fact", "cites": ["s1"] }
+                ],
+                "counterpoints": [
+                  { "text": "บางคนในชุมชนมองว่า Three.js ใหญ่เกินไปสำหรับเอฟเฟกต์เล็กๆ และเลือกไลบรารีที่เล็กกว่า", "cites": ["s7"] }
+                ],
+                "confidence": "medium",
+                "confidenceReason": "ข้อที่ว่าใช้มากที่สุดมาจากชุมชนแหล่งเดียว",
+                "related": ["g-warn-1-1"],
+                "researchedAt": "2026-11-01T09:00:00.000Z"
+              },
+              {
+                "id": "g-do-2-2",
+                "level": "item",
+                "title": "GSAP + ScrollTrigger",
+                "status": "frontier",
+                "summary": "ไลบรารีแอนิเมชันที่ผูกการเคลื่อนไหวเข้ากับการเลื่อนหน้า",
+                "points": [
+                  { "text": "ScrollTrigger ผูกแอนิเมชันกับตำแหน่งการเลื่อน ทั้ง pin, scrub และ snap", "type": "fact", "cites": ["s2"] }
+                ],
+                "confidence": "high",
+                "confidenceReason": "มาจากเอกสารทางการของ GSAP",
+                "researchedAt": "2026-11-01T09:00:00.000Z"
+              },
+              {
+                "id": "g-do-2-3",
+                "level": "item",
+                "title": "Next.js",
+                "logo": "nextdotjs",
+                "status": "frontier",
+                "summary": "เฟรมเวิร์ก React ที่ใช้เป็นโครงของเว็บ คู่กับ React Three Fiber ได้",
+                "points": [
+                  { "text": "React Three Fiber ใช้ร่วมกับเว็บ React ได้ตรงๆ", "type": "fact", "cites": ["s1"] }
+                ],
+                "confidence": "medium",
+                "confidenceReason": "มีเอกสารอ้างอิงแหล่งเดียว",
+                "researchedAt": "2026-11-01T09:00:00.000Z"
+              }
+            ]
+          },
+          {
+            "id": "g-do-3",
+            "level": "group",
+            "title": "ทักษะและทีม",
+            "status": "planned",
+            "summary": "จะรีเสิร์ชว่าต้องมีทักษะไหน และทำคนเดียวได้แค่ไหน",
+            "children": []
+          },
+          {
+            "id": "g-do-4",
+            "level": "group",
+            "title": "ทางเลือกและวิธีเลือก",
+            "status": "done",
+            "summary": "เครื่องมือหลายตัวทำได้คล้ายกัน ต้องรู้ว่าเมื่อไหร่ใช้ตัวไหน",
+            "researchedAt": "2026-11-01T09:00:00.000Z",
+            "children": [
+              {
+                "id": "g-do-4-1",
+                "level": "item",
+                "title": "Three.js, React Three Fiber หรือ Spline",
+                "status": "frontier",
+                "summary": "อยากคุมเองทั้งหมดใช้ Three.js ถ้าใช้ React อยู่แล้วใช้ React Three Fiber และถ้าอยากได้ผลเร็วโดยไม่เขียนโค้ดใช้ Spline",
+                "points": [
+                  { "text": "React Three Fiber เขียน Three.js เป็น component ของ React", "type": "fact", "cites": ["s1", "s7"] }
+                ],
+                "confidence": "medium",
+                "confidenceReason": "ข้อเปรียบเทียบส่วนใหญ่เป็นความเห็นจากชุมชน",
+                "related": ["g-do-2-1"],
+                "researchedAt": "2026-11-01T09:00:00.000Z"
+              }
+            ]
+          },
+          {
+            "id": "g-do-5",
+            "level": "group",
+            "title": "เทคนิค",
+            "status": "done",
+            "summary": "เทคนิคที่เจอซ้ำๆ เมื่อแกะเว็บที่ได้รางวัล",
+            "researchedAt": "2026-11-01T09:00:00.000Z",
+            "children": [
+              {
+                "id": "g-do-5-1",
+                "level": "item",
+                "title": "เล่าเรื่องตามการเลื่อน",
+                "status": "checking",
+                "summary": "ผูกกล้อง 3D และแอนิเมชันเข้ากับตำแหน่งการเลื่อนหน้า",
+                "points": [
+                  { "text": "ScrollTrigger แบบ scrub ให้การเลื่อนคุมไทม์ไลน์", "type": "fact", "cites": ["s2"] },
+                  { "text": "เป็นเทคนิคที่เจอในเว็บรางวัลเกือบทุกเว็บ", "type": "opinion", "cites": ["s7", "s4"] }
+                ],
+                "confidence": "high",
+                "confidenceReason": "เอกสารทางการยืนยันวิธีทำ และหลายแหล่งเห็นตรงกันว่าพบบ่อย",
+                "expansions": [{ "direction": "detail", "at": "2026-11-01T10:30:00.000Z" }],
+                "researchedAt": "2026-11-01T10:30:00.000Z",
+                "children": [
+                  {
+                    "id": "g-do-5-1-1",
+                    "level": "item",
+                    "title": "กล้องเดินตามเส้นทาง",
+                    "status": "checking",
+                    "summary": "สร้างเส้นโค้งแล้วให้กล้องวิ่งตามเมื่อเลื่อนหน้า",
+                    "points": [
+                      { "text": "ใช้ CatmullRomCurve3 สร้างเส้นทางให้กล้อง", "type": "fact", "cites": ["s1"] }
+                    ],
+                    "confidence": "medium",
+                    "confidenceReason": "ยังไม่ผ่านรอบตรวจสุดท้าย",
+                    "researchedAt": "2026-11-01T10:30:00.000Z",
+                    "children": []
+                  },
+                  {
+                    "id": "g-do-5-1-2",
+                    "level": "item",
+                    "title": "Pin + scrub timeline",
+                    "status": "checking",
+                    "summary": "ค้างหน้าจอไว้ แล้วให้การเลื่อนเล่นไทม์ไลน์ทีละช็อต",
+                    "points": [
+                      { "text": "pin ค้าง section ไว้ระหว่างที่ไทม์ไลน์เล่น", "type": "fact", "cites": ["s2"] }
+                    ],
+                    "confidence": "medium",
+                    "confidenceReason": "ยังไม่ผ่านรอบตรวจสุดท้าย",
+                    "researchedAt": "2026-11-01T10:30:00.000Z",
+                    "children": []
+                  }
+                ]
+              },
+              {
+                "id": "g-do-5-2",
+                "level": "item",
+                "title": "เอฟเฟกต์ด้วย Shader",
+                "status": "researching",
+                "summary": "บิดภาพ ทำคลื่น noise และ transition ระหว่างรูป",
+                "points": [
+                  { "text": "noise ทำให้พื้นผิวดูมีชีวิต", "type": "opinion", "cites": ["s7"] }
+                ],
+                "confidence": "medium",
+                "confidenceReason": "มาจากความเห็นในชุมชน",
+                "researchedAt": "2026-11-01T09:00:00.000Z"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "z-see",
+        "level": "zone",
+        "title": "ดูของจริง",
+        "summary": "ตัวอย่างงานจริง ใครเป็นผู้นำ และแบบไหนเรียกว่าดี",
+        "children": [
+          {
+            "id": "g-see-1",
+            "level": "group",
+            "title": "ตัวอย่างจริง",
+            "status": "checking",
+            "summary": "เว็บที่แกะมาดูว่าใช้อะไรและทำยังไง",
+            "researchedAt": "2026-11-01T10:30:00.000Z",
+            "children": [
+              {
+                "id": "g-see-1-1",
+                "level": "item",
+                "title": "แกะเว็บที่ได้รางวัล 3 เว็บ",
+                "status": "checking",
+                "summary": "เปิด DevTools ดูว่าแต่ละเว็บใช้เครื่องมืออะไร",
+                "points": [
+                  { "text": "ทั้ง 3 เว็บใช้ GSAP คุมจังหวะการเลื่อน", "type": "fact", "cites": ["s2", "s7"] }
+                ],
+                "confidence": "medium",
+                "confidenceReason": "ยังไม่ผ่านรอบตรวจสุดท้าย",
+                "researchedAt": "2026-11-01T10:30:00.000Z"
+              }
+            ]
+          },
+          {
+            "id": "g-see-2",
+            "level": "group",
+            "title": "ผู้เล่นหลัก",
+            "status": "planned",
+            "summary": "จะรีเสิร์ชว่าสตูดิโอไหนได้รางวัลแนวนี้บ่อย",
+            "children": []
+          },
+          {
+            "id": "g-see-3",
+            "level": "group",
+            "title": "เกณฑ์ว่าแบบไหนดี",
+            "status": "done",
+            "summary": "ใช้วัดว่างานของเราดีพอหรือยัง",
+            "researchedAt": "2026-11-01T09:00:00.000Z",
+            "children": [
+              {
+                "id": "g-see-3-1",
+                "level": "item",
+                "title": "เกณฑ์ของ Awwwards",
+                "status": "frontier",
+                "summary": "Design 40% Usability 30% Creativity 20% และ Content 10%",
+                "points": [
+                  { "text": "Design มีน้ำหนักมากที่สุดที่ 40% ของคะแนน", "type": "fact", "key": true, "cites": ["s4", "s7"] }
+                ],
+                "confidence": "high",
+                "confidenceReason": "มาจากหน้าเกณฑ์ของ Awwwards เอง และชุมชนยืนยัน",
+                "researchedAt": "2026-11-01T09:00:00.000Z"
+              },
+              {
+                "id": "g-see-3-2",
+                "level": "item",
+                "title": "Core Web Vitals",
+                "status": "frontier",
+                "summary": "ตัวชี้วัดความเร็วจาก Google ที่ใช้วัดว่าเว็บโหลดเร็วพอไหม",
+                "points": [
+                  { "text": "LCP ที่ดีคือไม่เกิน 2.5 วินาที", "type": "fact", "key": true, "cites": ["s3", "s8"] }
+                ],
+                "confidence": "high",
+                "confidenceReason": "แหล่งทางการของ Google",
+                "researchedAt": "2026-11-01T09:00:00.000Z"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "z-warn",
+        "level": "zone",
+        "title": "ระวัง",
+        "summary": "จุดที่พลาดบ่อย ความเข้าใจผิด และต้นทุนที่ต้องเตรียม",
+        "children": [
+          {
+            "id": "g-warn-1",
+            "level": "group",
+            "title": "ข้อควรระวัง",
+            "status": "done",
+            "summary": "จุดที่โปรเจกต์แบบนี้พลาดกันบ่อย",
+            "researchedAt": "2026-11-01T09:00:00.000Z",
+            "children": [
+              {
+                "id": "g-warn-1-1",
+                "level": "item",
+                "title": "มือถือกระตุก",
+                "status": "frontier",
+                "summary": "GPU ของมือถืออ่อนกว่าคอมมาก ฉากเดียวกันอาจกระตุก",
+                "points": [
+                  { "text": "จำกัด pixel ratio ไม่เกิน 2 ช่วยลดภาระการ์ดจอ", "type": "fact", "cites": ["s7", "s1"] },
+                  { "text": "ทดสอบบนมือถือจริงเสมอ", "type": "opinion", "cites": ["s7"] }
+                ],
+                "confidence": "medium",
+                "confidenceReason": "วิธีแก้มีเอกสารรองรับ แต่ขนาดของปัญหามาจากชุมชน",
+                "related": ["g-know-3-2"],
+                "researchedAt": "2026-11-01T09:00:00.000Z"
+              },
+              {
+                "id": "g-warn-1-2",
+                "level": "item",
+                "title": "ไฟล์ใหญ่ โหลดนาน",
+                "status": "frontier",
+                "summary": "โมเดลและ texture ใหญ่ทำให้ผู้ใช้ต้องรอ",
+                "points": [
+                  { "text": "บีบโมเดลด้วย Draco และ texture ด้วย KTX2", "type": "fact", "cites": ["s1"] }
+                ],
+                "confidence": "medium",
+                "confidenceReason": "มีเอกสารอ้างอิงแหล่งเดียว",
+                "researchedAt": "2026-11-01T09:00:00.000Z"
+              }
+            ]
+          },
+          {
+            "id": "g-warn-2",
+            "level": "group",
+            "title": "ความเข้าใจผิด",
+            "status": "done",
+            "summary": "สิ่งที่คนมักเชื่อ แต่ไม่จริง",
+            "researchedAt": "2026-11-01T09:00:00.000Z",
+            "children": [
+              {
+                "id": "g-warn-2-1",
+                "level": "item",
+                "title": "3D เยอะเท่ากับได้รางวัล",
+                "status": "frontier",
+                "summary": "ไม่จริง กรรมการให้น้ำหนักดีไซน์และการใช้งานมากกว่า",
+                "points": [
+                  { "text": "Design กับ Usability รวมกันได้ 70% ของคะแนน", "type": "fact", "cites": ["s4"] }
+                ],
+                "confidence": "medium",
+                "confidenceReason": "มีเอกสารอ้างอิงแหล่งเดียว",
+                "related": ["g-see-3-1"],
+                "researchedAt": "2026-11-01T09:00:00.000Z"
+              }
+            ]
+          },
+          {
+            "id": "g-warn-3",
+            "level": "group",
+            "title": "ต้นทุนและเวลา",
+            "status": "planned",
+            "summary": "จะรีเสิร์ชว่าต้องใช้งบและเวลาเท่าไหร่",
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "z-next",
+        "level": "zone",
+        "title": "ไปต่อ",
+        "summary": "ก้าวต่อไป เทรนด์ที่กำลังมา แหล่งเรียนรู้ และสิ่งที่ยังไม่มีคำตอบชัด",
+        "children": [
+          {
+            "id": "g-next-1",
+            "level": "group",
+            "title": "ต่อยอดต่อ",
+            "status": "done",
+            "summary": "ก้าวต่อไปที่แนะนำจากผลรีเสิร์ชนี้",
+            "researchedAt": "2026-11-01T09:00:00.000Z",
+            "children": [
+              {
+                "id": "g-next-1-1",
+                "level": "item",
+                "title": "ทำฉาก 3D เลื่อนตามสกอร์ล 1 ฉาก",
+                "status": "frontier",
+                "summary": "โปรเจกต์เล็กที่รวม Three.js และ GSAP ไว้ด้วยกัน",
+                "points": [
+                  { "text": "เริ่มจากฉากเดียวที่กล้องขยับตามการเลื่อน", "type": "opinion", "cites": ["s2", "s7"] }
+                ],
+                "confidence": "medium",
+                "confidenceReason": "เป็นคำแนะนำจากชุมชนและเอกสาร",
+                "related": ["g-do-5-1"],
+                "researchedAt": "2026-11-01T09:00:00.000Z"
+              }
+            ]
+          },
+          {
+            "id": "g-next-2",
+            "level": "group",
+            "title": "เทรนด์",
+            "status": "done",
+            "summary": "สิ่งที่กำลังเปลี่ยนวงการ",
+            "researchedAt": "2026-11-01T09:00:00.000Z",
+            "children": [
+              {
+                "id": "g-next-2-1",
+                "level": "item",
+                "title": "WebGPU",
+                "status": "frontier",
+                "summary": "API กราฟิกรุ่นใหม่ที่ออกแบบมาต่อจาก WebGL",
+                "points": [
+                  { "text": "WebGPU ให้ใช้ compute shader บนการ์ดจอได้", "type": "fact", "cites": ["s6"] }
+                ],
+                "conflicts": [
+                  { "text": "MDN ระบุว่า WebGPU ยังรองรับไม่ครบทุกเบราว์เซอร์ ส่วนในฟอรัม three.js มีคนบอกว่าใช้กับงานจริงได้แล้ว", "cites": ["s6", "s7"] }
+                ],
+                "confidence": "low",
+                "confidenceReason": "แหล่งขัดกันเรื่องความพร้อมใช้งาน",
+                "researchedAt": "2026-11-01T09:00:00.000Z"
+              }
+            ]
+          },
+          {
+            "id": "g-next-3",
+            "level": "group",
+            "title": "แหล่งเรียนรู้และคอมมูนิตี้",
+            "status": "planned",
+            "summary": "จะรีเสิร์ชว่าควรไปเรียนต่อที่ไหน",
+            "children": []
+          },
+          {
+            "id": "g-next-4",
+            "level": "group",
+            "title": "คำถามที่ยังเปิดอยู่",
+            "status": "done",
+            "summary": "เรื่องที่แหล่งข้อมูลยังเห็นไม่ตรงกัน หรือยังไม่มีคำตอบชัด",
+            "researchedAt": "2026-11-01T09:00:00.000Z",
+            "children": [
+              {
+                "id": "g-next-4-1",
+                "level": "item",
+                "title": "SEO ของเว็บ 3D ทำได้ดีแค่ไหน",
+                "status": "frontier",
+                "summary": "มีวิธีช่วยอยู่ แต่ยังไม่มีข้อสรุปชัด",
+                "points": [
+                  { "text": "ข้อความที่วาดใน canvas เครื่องมือค้นหาอ่านไม่ได้ จึงควรมีเนื้อหาเป็น HTML ปกติด้วย", "type": "opinion", "cites": ["s7", "s5"] }
+                ],
+                "confidence": "low",
+                "confidenceReason": "ยังไม่มีแหล่งทางการที่ตอบตรงๆ",
+                "researchedAt": "2026-11-01T09:00:00.000Z"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "readingPath": ["g-know-1-1", "g-know-3-1", "g-do-2-1", "g-do-5-1", "g-warn-1-1"],
+  "summary": {
+    "findings": [
+      { "text": "เว็บรางวัลตัดสินที่ดีไซน์และการใช้งานเป็นหลัก ไม่ใช่ปริมาณ 3D", "cites": ["s4", "s7"] },
+      { "text": "ชุดเครื่องมือที่เจอบ่อยที่สุดคือ Three.js คู่กับ GSAP และ ScrollTrigger", "cites": ["s1", "s2"] },
+      { "text": "จะลื่นได้ต้องทำ 60fps คือมีเวลาราว 16ms ต่อเฟรม", "cites": ["s3", "s8"] },
+      { "text": "ปัญหาที่เจอบ่อยที่สุดคือมือถือกระตุก", "cites": ["s7"], "singleSource": true },
+      { "text": "WebGPU กำลังมา แต่ยังต้องเผื่อ WebGL ไว้", "cites": ["s6", "s5"] }
+    ],
+    "startTomorrow": [
+      "อ่านเรื่องเบราว์เซอร์วาดหน้าเว็บยังไงให้เข้าใจก่อน",
+      "ลองทำฉาก Three.js หนึ่งฉากที่กล้องขยับตามการเลื่อน",
+      "เปิดเว็บที่ได้รางวัล 1 เว็บแล้วแกะด้วย DevTools"
+    ]
+  },
+  "queue": [
+    { "id": "r-mhg9k2x0-a1b2", "nodeId": "g-do-5-2", "direction": "examples", "at": "2026-11-01T10:20:00.000Z", "status": "researching" },
+    { "id": "r-mhg9m4q1-c3d4", "nodeId": "g-warn-1-2", "direction": "detail", "at": "2026-11-01T10:25:00.000Z", "status": "pending" }
+  ],
+  "inboxOffset": 0
+}
