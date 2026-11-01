@@ -1,0 +1,494 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { appendRequest, readRequests, watchInbox } = require('../scripts/lib/inbox.cjs');
+
+// Almost every Thai character is 3 bytes in UTF-8, so a byte offset and a character offset are far apart.
+const THAI = 'ราคาเท่าไร ใช้เวลานานแค่ไหน';
+
+function tmpDir(t) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dr-inbox-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 }));
+  return dir;
+}
+const inboxFile = dir => path.join(dir, 'inbox.jsonl');
+const sizeOf = dir => fs.statSync(inboxFile(dir)).size;
+// A request line the way a hand-written file would hold it.
+const requestLine = (nodeId, extra = {}) =>
+  JSON.stringify({ id: `r-${nodeId}`, nodeId, direction: 'detail', at: '2026-11-01T00:00:00.000Z', ...extra });
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+// Waits until check() is truthy. The limits below are generous: only a broken watch ever reaches one.
+async function waitFor(check, what, ms = 5000) {
+  const deadline = Date.now() + ms;
+  while (!check()) {
+    assert.ok(Date.now() < deadline, `timed out waiting for ${what}`);
+    await sleep(5);
+  }
+}
+function within(promise, ms, what) {
+  let timer;
+  const limit = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`timed out waiting for ${what}`)), ms); });
+  return Promise.race([promise, limit]).finally(() => clearTimeout(timer));
+}
+// Starts a watch that is stopped when the test ends, however it ends.
+function startWatch(t, dir, options) {
+  const watch = watchInbox(dir, options);
+  t.after(() => watch.stop());
+  return watch;
+}
+// Counts how often the inbox file is opened. A poll opens it once, and these tests touch it only on their own cue.
+function countPolls(t, dir) {
+  const real = fs.openSync;
+  const polls = { count: 0 };
+  t.mock.method(fs, 'openSync', (file, ...rest) => {
+    if (file === inboxFile(dir)) polls.count += 1;
+    return real(file, ...rest);
+  });
+  return polls;
+}
+// The set of files that have been opened and not yet closed.
+function trackOpenFiles(t) {
+  const open = new Set();
+  const realOpen = fs.openSync;
+  const realClose = fs.closeSync;
+  t.mock.method(fs, 'openSync', (...args) => { const fd = realOpen(...args); open.add(fd); return fd; });
+  t.mock.method(fs, 'closeSync', fd => { open.delete(fd); return realClose(fd); });
+  return open;
+}
+
+// ---- appendRequest ----
+
+test('append and read', t => {
+  const dir = tmpDir(t);
+  const a = appendRequest(dir, { nodeId: 'g-know-1', direction: 'detail' });
+  const b = appendRequest(dir, { nodeId: 'g-warn-2', direction: 'question', question: 'how much does it cost?' });
+  const r = readRequests(dir);
+  assert.equal(r.requests.length, 2);
+  assert.deepEqual(r.requests, [a, b]);
+  assert.equal(r.offset, sizeOf(dir));
+});
+
+test('appendRequest returns the documented request and appends it as one JSON line', t => {
+  const dir = tmpDir(t);
+  const before = Date.now();
+  const plain = appendRequest(dir, { nodeId: 'g-know-1', direction: 'detail' });
+  const asked = appendRequest(dir, { nodeId: 'g-do-2', direction: 'question', question: THAI });
+  const after = Date.now();
+  // No question key at all when none was given, so the line stays { id, nodeId, direction, at }.
+  assert.deepEqual(Object.keys(plain), ['id', 'nodeId', 'direction', 'at']);
+  assert.deepEqual(Object.keys(asked), ['id', 'nodeId', 'direction', 'question', 'at']);
+  assert.equal(asked.question, THAI);
+  for (const req of [plain, asked]) {
+    assert.match(req.id, /^r-[0-9a-z]+-[0-9a-z]{4}$/);
+    const idTime = parseInt(req.id.split('-')[1], 36);
+    assert.ok(idTime >= before && idTime <= after, 'the id carries the time of the request');
+    assert.equal(new Date(req.at).toISOString(), req.at, 'at is an ISO 8601 UTC time');
+    assert.ok(Date.parse(req.at) >= before && Date.parse(req.at) <= after);
+  }
+  assert.equal(fs.readFileSync(inboxFile(dir), 'utf8'), `${JSON.stringify(plain)}\n${JSON.stringify(asked)}\n`);
+});
+
+test('every id is r-<time>-<4 base-36 characters>, and all 4 are random', t => {
+  const dir = tmpDir(t);
+  const ids = Array.from({ length: 500 }, () => appendRequest(dir, { nodeId: 'g-know-1', direction: 'detail' }).id);
+  // One draw in 36 is below 36^3 and would come out short if it were not padded, so 500 draws all but surely show it.
+  for (const id of ids) assert.match(id, /^r-[0-9a-z]+-[0-9a-z]{4}$/);
+  const suffixes = ids.map(id => id.slice(-4));
+  assert.ok(new Set(suffixes).size > 450, 'the suffix varies from one request to the next');
+  for (let place = 0; place < 4; place++) {
+    assert.ok(new Set(suffixes.map(s => s[place])).size > 20, `character ${place + 1} of the suffix takes many values`);
+  }
+});
+
+test('appendRequest rejects a request without nodeId, direction or a text question, and writes nothing', t => {
+  const dir = tmpDir(t);
+  const bad = [
+    undefined, {}, { nodeId: 'g-know-1' }, { direction: 'detail' },
+    { nodeId: '', direction: 'detail' }, { nodeId: 'g-know-1', direction: '' },
+    { nodeId: 7, direction: 'detail' }, { nodeId: 'g-know-1', direction: ['detail'] },
+    { nodeId: 'g-know-1', direction: 'question', question: 5 },
+  ];
+  for (const req of bad) assert.throws(() => appendRequest(dir, req), /nodeId|direction|question/, JSON.stringify(req));
+  assert.equal(fs.existsSync(inboxFile(dir)), false);
+});
+
+test('appendRequest accepts a null question and leaves it out', t => {
+  const dir = tmpDir(t);
+  const req = appendRequest(dir, { nodeId: 'g-know-1', direction: 'detail', question: null });
+  assert.equal('question' in req, false);
+  assert.equal(JSON.parse(fs.readFileSync(inboxFile(dir), 'utf8')).question, undefined);
+});
+
+test('a question with line breaks and U+2028 stays on one line and reads back unchanged', t => {
+  const dir = tmpDir(t);
+  const question = 'บรรทัดแรก\nบรรทัดสอง\r\nสาม สี่ ห้า "quoted" \\ back </script><!--';
+  const req = appendRequest(dir, { nodeId: 'g-know-1', direction: 'question', question });
+  assert.equal(fs.readFileSync(inboxFile(dir), 'utf8').split('\n').length, 2, 'one line, then the empty piece after its newline');
+  const r = readRequests(dir);
+  assert.deepEqual(r.requests, [req]);
+  assert.equal(r.requests[0].question, question);
+});
+
+test('appendRequest starts a new line when the file ends in an unterminated one', t => {
+  const dir = tmpDir(t);
+  const first = appendRequest(dir, { nodeId: 'g-know-1', direction: 'detail' });
+  fs.appendFileSync(inboxFile(dir), '{"id":"torn"'); // a writer that died part way through its line
+  const next = appendRequest(dir, { nodeId: 'g-know-2', direction: 'examples' });
+  const r = readRequests(dir);
+  // Without the new line the torn text and this request would be one broken line, and the request would be lost.
+  assert.deepEqual(r.requests, [first, next]);
+  assert.equal(r.offset, sizeOf(dir));
+});
+
+// ---- readRequests ----
+
+test('partial line is not consumed', t => {
+  const dir = tmpDir(t);
+  const a = appendRequest(dir, { nodeId: 'g-know-1', direction: 'detail' });
+  const b = appendRequest(dir, { nodeId: 'g-know-2', direction: 'detail' });
+  const complete = sizeOf(dir);
+  fs.appendFileSync(inboxFile(dir), '{"id":"x"'); // no newline yet
+  const r = readRequests(dir);
+  assert.deepEqual(r.requests, [a, b]);
+  assert.equal(r.offset, complete, 'the offset stays before the partial text');
+  assert.deepEqual(readRequests(dir, r.offset), { requests: [], offset: complete }, 'and reading on from it consumes nothing');
+});
+
+test('a partial line is delivered once it is completed, and only once', t => {
+  const dir = tmpDir(t);
+  const full = requestLine('g-know-3', { id: 'r-late' });
+  fs.appendFileSync(inboxFile(dir), full.slice(0, 20));
+  const first = readRequests(dir);
+  assert.deepEqual(first, { requests: [], offset: 0 });
+  fs.appendFileSync(inboxFile(dir), `${full.slice(20)}\n`);
+  const second = readRequests(dir, first.offset);
+  assert.deepEqual(second.requests.map(r => r.id), ['r-late']);
+  assert.equal(second.offset, sizeOf(dir));
+  assert.deepEqual(readRequests(dir, second.offset), { requests: [], offset: second.offset });
+});
+
+test('Thai text: the offset counts bytes, not characters', t => {
+  const dir = tmpDir(t);
+  const first = appendRequest(dir, { nodeId: 'g-know-1', direction: 'question', question: THAI });
+  const text = fs.readFileSync(inboxFile(dir), 'utf8');
+  assert.ok(Buffer.byteLength(text) > text.length, 'the file holds multi-byte characters');
+  const r1 = readRequests(dir);
+  assert.deepEqual(r1.requests, [first]);
+  assert.equal(r1.offset, sizeOf(dir));
+  assert.equal(r1.offset, Buffer.byteLength(text));
+  assert.notEqual(r1.offset, text.length);
+  // Reading on from the stored offset must land exactly on the next line.
+  const second = appendRequest(dir, { nodeId: 'g-warn-1', direction: 'question', question: `${THAI} อีกครั้ง` });
+  const r2 = readRequests(dir, r1.offset);
+  assert.deepEqual(r2.requests, [second]);
+  assert.equal(r2.offset, sizeOf(dir));
+  assert.deepEqual(readRequests(dir, r2.offset), { requests: [], offset: r2.offset });
+});
+
+test('a read that stops in the middle of a Thai character waits for the rest of it', t => {
+  const dir = tmpDir(t);
+  const done = appendRequest(dir, { nodeId: 'g-know-1', direction: 'detail' });
+  const complete = sizeOf(dir);
+  const line = Buffer.from(`${JSON.stringify({ id: 'r-cut', nodeId: 'g-know-2', direction: 'question', question: THAI, at: '2026-11-01T00:00:00.000Z' })}\n`);
+  const cut = line.indexOf(Buffer.from('ร')) + 1; // one byte into the first 3-byte letter of the question
+  fs.appendFileSync(inboxFile(dir), line.subarray(0, cut));
+  const early = readRequests(dir);
+  assert.deepEqual(early, { requests: [done], offset: complete });
+  fs.appendFileSync(inboxFile(dir), line.subarray(cut));
+  const late = readRequests(dir, early.offset);
+  assert.equal(late.requests.length, 1);
+  assert.equal(late.requests[0].question, THAI);
+  assert.equal(late.offset, sizeOf(dir));
+});
+
+test('readRequests on a missing file returns the offset it was given', t => {
+  const dir = tmpDir(t);
+  assert.deepEqual(readRequests(dir), { requests: [], offset: 0 });
+  assert.deepEqual(readRequests(dir, 17), { requests: [], offset: 17 });
+  assert.deepEqual(readRequests(path.join(dir, 'no-such-folder'), 5), { requests: [], offset: 5 });
+});
+
+test('readRequests from an offset returns only the requests after it', t => {
+  const dir = tmpDir(t);
+  const a = appendRequest(dir, { nodeId: 'g-know-1', direction: 'detail' });
+  const afterA = sizeOf(dir);
+  const b = appendRequest(dir, { nodeId: 'g-know-2', direction: 'examples' });
+  const afterB = sizeOf(dir);
+  const c = appendRequest(dir, { nodeId: 'g-know-3', direction: 'compare' });
+  assert.deepEqual(readRequests(dir, 0), { requests: [a, b, c], offset: sizeOf(dir) });
+  assert.deepEqual(readRequests(dir, afterA), { requests: [b, c], offset: sizeOf(dir) });
+  assert.deepEqual(readRequests(dir, afterB), { requests: [c], offset: sizeOf(dir) });
+});
+
+test('an offset at or past the end of the file reads nothing and comes back unchanged', t => {
+  const dir = tmpDir(t);
+  appendRequest(dir, { nodeId: 'g-know-1', direction: 'detail' });
+  const end = sizeOf(dir);
+  assert.deepEqual(readRequests(dir, end), { requests: [], offset: end });
+  assert.deepEqual(readRequests(dir, end + 100), { requests: [], offset: end + 100 });
+});
+
+test('blank, malformed and non-object lines are skipped but still consumed', t => {
+  const dir = tmpDir(t);
+  const lines = [requestLine('g-know-1'), '', '   ', '{"id":"broken"', 'null', '42', '[]', '"text"', 'not json at all', requestLine('g-know-2')];
+  fs.writeFileSync(inboxFile(dir), `${lines.join('\n')}\n`);
+  const r = readRequests(dir);
+  assert.deepEqual(r.requests.map(x => x.nodeId), ['g-know-1', 'g-know-2']);
+  assert.equal(r.offset, sizeOf(dir), 'a bad line must not hold the offset back, or it would block every line after it');
+});
+
+test('CRLF line endings and a leading BOM are tolerated', t => {
+  const dir = tmpDir(t);
+  fs.writeFileSync(inboxFile(dir), `﻿${requestLine('g-know-1')}\r\n\r\n${requestLine('g-know-2')}\r\n`);
+  const r = readRequests(dir);
+  assert.deepEqual(r.requests.map(x => x.nodeId), ['g-know-1', 'g-know-2']);
+  assert.equal(r.offset, sizeOf(dir));
+});
+
+test('readRequests rejects an offset that is not a non-negative integer', t => {
+  const dir = tmpDir(t);
+  for (const bad of [-1, 1.5, NaN, Infinity, '0', null]) assert.throws(() => readRequests(dir, bad), /offset/, String(bad));
+});
+
+test('readRequests reports any read error other than a missing file', t => {
+  const dir = tmpDir(t);
+  const real = fs.openSync;
+  t.mock.method(fs, 'openSync', (file, ...rest) => {
+    if (file === inboxFile(dir)) throw Object.assign(new Error('access denied'), { code: 'EACCES' });
+    return real(file, ...rest);
+  });
+  assert.throws(() => readRequests(dir), /access denied/);
+});
+
+test('readRequests stops when the file shrinks under it instead of waiting for bytes that are gone', t => {
+  const dir = tmpDir(t);
+  appendRequest(dir, { nodeId: 'g-know-1', direction: 'detail' });
+  let calls = 0;
+  // Every read finds nothing left. The assertion turns a reader that would loop forever into a failure.
+  t.mock.method(fs, 'readSync', () => {
+    assert.ok(++calls < 100, 'readRequests keeps reading a file that has nothing left');
+    return 0;
+  });
+  assert.deepEqual(readRequests(dir), { requests: [], offset: 0 });
+});
+
+test('every file that appendRequest or readRequests opens is closed again, even when they fail', t => {
+  const dir = tmpDir(t);
+  const open = trackOpenFiles(t);
+  appendRequest(dir, { nodeId: 'g-know-1', direction: 'detail' });
+  appendRequest(dir, { nodeId: 'g-know-2', direction: 'detail' }); // the file has content now, so this one also peeks at its last byte
+  readRequests(dir);
+  readRequests(dir, sizeOf(dir));
+  readRequests(path.join(dir, 'no-such-folder'));
+  assert.equal(open.size, 0, 'after calls that succeed');
+  t.mock.method(fs, 'readSync', () => { throw new Error('disk error'); });
+  assert.throws(() => readRequests(dir), /disk error/);
+  assert.throws(() => appendRequest(dir, { nodeId: 'g-know-3', direction: 'detail' }), /disk error/);
+  assert.equal(open.size, 0, 'after calls that fail');
+});
+
+// ---- watchInbox ----
+
+test('watchInbox reports requests then idles', async t => {
+  const dir = tmpDir(t);
+  const events = [];
+  const finished = new Promise(resolve => {
+    startWatch(t, dir, {
+      offset: 0, pollMs: 20, idleMs: 150,
+      onRequest: req => events.push(`request ${req.nodeId}`),
+      onIdle: () => { events.push('idle'); resolve(); },
+    });
+    // The watch is running but has not polled yet, so this request arrives after it started.
+    appendRequest(dir, { nodeId: 'g-know-1', direction: 'detail' });
+  });
+  await within(finished, 5000, 'the watch to go idle');
+  assert.deepEqual(events, ['request g-know-1', 'idle']);
+});
+
+test('watchInbox reports the requests already in the file, from the offset it is given (0 when none is)', async t => {
+  const dir = tmpDir(t);
+  const a = appendRequest(dir, { nodeId: 'g-know-1', direction: 'detail' });
+  const afterA = sizeOf(dir);
+  const b = appendRequest(dir, { nodeId: 'g-know-2', direction: 'detail' });
+  const c = appendRequest(dir, { nodeId: 'g-know-3', direction: 'detail' });
+  const reported = options => within(new Promise(resolve => {
+    const ids = [];
+    startWatch(t, dir, { pollMs: 20, idleMs: 60, ...options, onRequest: r => ids.push(r.id), onIdle: () => resolve(ids) });
+  }), 5000, 'the watch to go idle');
+  assert.deepEqual(await reported({ offset: 0 }), [a.id, b.id, c.id]);
+  assert.deepEqual(await reported({ offset: afterA }), [b.id, c.id]);
+  assert.deepEqual(await reported({ offset: sizeOf(dir) }), []);
+  assert.deepEqual(await reported({}), [a.id, b.id, c.id]);
+});
+
+test('watchInbox keeps polling an inbox that does not exist yet and reports once the file appears', async t => {
+  const dir = tmpDir(t);
+  const polls = countPolls(t, dir);
+  const seen = [];
+  startWatch(t, dir, { offset: 0, pollMs: 20, idleMs: 60_000, onRequest: r => seen.push(r.nodeId) });
+  await waitFor(() => polls.count >= 3, 'three polls of the missing file');
+  assert.equal(fs.existsSync(inboxFile(dir)), false);
+  assert.deepEqual(seen, []);
+  appendRequest(dir, { nodeId: 'g-warn-1', direction: 'examples' });
+  await waitFor(() => seen.length === 1, 'the first request');
+  appendRequest(dir, { nodeId: 'g-warn-2', direction: 'examples' });
+  await waitFor(() => seen.length === 2, 'the second request');
+  assert.deepEqual(seen, ['g-warn-1', 'g-warn-2']);
+});
+
+test('watchInbox also waits for a topic folder that does not exist yet', async t => {
+  const dir = path.join(tmpDir(t), 'later');
+  const polls = countPolls(t, dir);
+  const seen = [];
+  startWatch(t, dir, { offset: 0, pollMs: 20, idleMs: 60_000, onRequest: r => seen.push(r.nodeId) });
+  await waitFor(() => polls.count >= 3, 'three polls of the missing folder');
+  fs.mkdirSync(dir);
+  appendRequest(dir, { nodeId: 'g-warn-1', direction: 'examples' });
+  await waitFor(() => seen.length === 1, 'the request');
+  assert.deepEqual(seen, ['g-warn-1']);
+});
+
+test('watchInbox polls at the pollMs it is given, however small', async t => {
+  const dir = tmpDir(t);
+  const polls = countPolls(t, dir);
+  startWatch(t, dir, { offset: 0, pollMs: 20, idleMs: 60_000, onRequest() {} });
+  // 25 polls in 4 s needs an interval under 160 ms, so a floor or a default of 250 or 1000 ms cannot do it. At the
+  // 20 ms asked for it takes under a second (timers on Windows tick about every 15 ms, so 20 ms comes out near 30).
+  await waitFor(() => polls.count >= 25, '25 polls', 4000);
+});
+
+test('the idle window restarts with each request, and a request is read before idle is declared', async t => {
+  const dir = tmpDir(t);
+  const idleMs = 200;
+  const log = [];
+  const finished = new Promise(resolve => {
+    let fed = 0;
+    startWatch(t, dir, {
+      offset: 0, pollMs: 20, idleMs,
+      onRequest: () => {
+        log.push(['request', performance.now()]);
+        // The next request is appended from inside the callback, so the watch finds it on its next poll whatever the load.
+        if (++fed < 3) appendRequest(dir, { nodeId: `g-know-${fed + 1}`, direction: 'detail' });
+      },
+      onIdle: () => { log.push(['idle', performance.now()]); resolve(); },
+    });
+    appendRequest(dir, { nodeId: 'g-know-1', direction: 'detail' });
+  });
+  await within(finished, 5000, 'the watch to go idle');
+  assert.deepEqual(log.map(([event]) => event), ['request', 'request', 'request', 'idle']);
+  const quiet = log[3][1] - log[2][1];
+  assert.ok(quiet >= idleMs, `idle came ${quiet} ms after the last request, before the ${idleMs} ms window ran out`);
+});
+
+test('a slow onRequest does not use up the idle window', async t => {
+  const dir = tmpDir(t);
+  const idleMs = 60;
+  appendRequest(dir, { nodeId: 'g-know-1', direction: 'detail' });
+  let handledAt;
+  const finished = new Promise(resolve => {
+    startWatch(t, dir, {
+      offset: 0, pollMs: 20, idleMs,
+      // 100 ms of work, longer than the whole window. The window counts from when the request has been handled.
+      onRequest: () => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100); handledAt = performance.now(); },
+      onIdle: () => resolve(performance.now()),
+    });
+  });
+  const idleAt = await within(finished, 5000, 'the watch to go idle');
+  assert.ok(idleAt - handledAt >= idleMs, `idle came ${idleAt - handledAt} ms after the request was handled`);
+});
+
+test('watchInbox calls onIdle once and then stops for good, no sooner than idleMs after it started', async t => {
+  const dir = tmpDir(t);
+  const idleMs = 60;
+  const calls = [];
+  const startedAt = performance.now();
+  let idleAt;
+  const finished = new Promise(resolve => {
+    startWatch(t, dir, {
+      offset: 0, pollMs: 20, idleMs,
+      onRequest: r => calls.push(`request ${r.nodeId}`),
+      onIdle: () => { idleAt = performance.now(); calls.push('idle'); resolve(); },
+    });
+  });
+  await within(finished, 5000, 'the watch to go idle');
+  assert.ok(idleAt - startedAt >= idleMs, `idle came ${idleAt - startedAt} ms after the start, before the ${idleMs} ms window ran out`);
+  appendRequest(dir, { nodeId: 'g-know-1', direction: 'detail' });
+  await sleep(150); // several polls: a watch that kept going would report the request
+  assert.deepEqual(calls, ['idle']);
+});
+
+test('the first poll comes right after watchInbox returns, not a pollMs later', async t => {
+  const dir = tmpDir(t);
+  appendRequest(dir, { nodeId: 'g-know-1', direction: 'detail' });
+  const seen = [];
+  startWatch(t, dir, { offset: 0, pollMs: 60_000, idleMs: 60_000, onRequest: r => seen.push(r.nodeId) });
+  await waitFor(() => seen.length === 1, 'the request that was already waiting', 3000);
+});
+
+test('an idleMs shorter than pollMs is still met', async t => {
+  const dir = tmpDir(t);
+  const finished = new Promise(resolve => {
+    startWatch(t, dir, { offset: 0, pollMs: 60_000, idleMs: 50, onRequest() {}, onIdle: resolve });
+  });
+  await within(finished, 3000, 'idle, a minute-long poll interval notwithstanding');
+});
+
+test('onIdle is optional', async t => {
+  const dir = tmpDir(t);
+  appendRequest(dir, { nodeId: 'g-know-1', direction: 'detail' });
+  const seen = [];
+  startWatch(t, dir, { offset: 0, pollMs: 20, idleMs: 0, onRequest: r => seen.push(r.nodeId) });
+  await waitFor(() => seen.length === 1, 'the request');
+  await sleep(50); // idle is declared in the same poll as the request, and would have thrown on a missing onIdle by now
+  assert.deepEqual(seen, ['g-know-1']);
+});
+
+test('stop() ends the watch before it reports anything, idle included', async t => {
+  const dir = tmpDir(t);
+  appendRequest(dir, { nodeId: 'g-know-1', direction: 'detail' }); // already waiting in the file
+  const calls = [];
+  // idleMs 0 would report the request and go idle at once if this watch were not stopped.
+  const watch = watchInbox(dir, { offset: 0, pollMs: 20, idleMs: 0, onRequest: () => calls.push('request'), onIdle: () => calls.push('idle') });
+  watch.stop();
+  watch.stop(); // stopping twice is fine
+  await sleep(150);
+  assert.deepEqual(calls, []);
+});
+
+test('stop() inside onRequest drops the rest of that batch and never reports idle', async t => {
+  for (const waiting of [1, 3]) { // with one request, stop() runs in the last callback of the batch
+    const dir = tmpDir(t);
+    for (let i = 1; i <= waiting; i++) appendRequest(dir, { nodeId: `g-know-${i}`, direction: 'detail' });
+    const calls = [];
+    // idleMs 0 would declare idle right after the batch if stop() did not hold.
+    const watch = startWatch(t, dir, {
+      offset: 0, pollMs: 20, idleMs: 0,
+      onRequest: r => { calls.push(r.nodeId); watch.stop(); },
+      onIdle: () => calls.push('idle'),
+    });
+    await sleep(150);
+    assert.deepEqual(calls, ['g-know-1'], `${waiting} request(s) waiting`);
+  }
+});
+
+test('watchInbox rejects options it cannot honor', t => {
+  const dir = tmpDir(t);
+  const ok = { offset: 0, pollMs: 20, idleMs: 100, onRequest() {} };
+  const started = [];
+  t.after(() => started.forEach(watch => watch.stop())); // a watch that should have been refused must not outlive the test
+  const bad = [
+    { onRequest: undefined }, { onRequest: 'go' }, { onIdle: 'done' },
+    { pollMs: 0 }, { pollMs: -5 }, { pollMs: NaN }, { pollMs: Infinity }, { pollMs: '20' },
+    { idleMs: -1 }, { idleMs: NaN }, { idleMs: '100' },
+    { offset: -1 }, { offset: 1.5 }, { offset: '0' }, { offset: null },
+  ];
+  for (const options of bad) {
+    assert.throws(() => started.push(watchInbox(dir, { ...ok, ...options })), /onRequest|onIdle|pollMs|idleMs|offset/, JSON.stringify(options));
+  }
+  // The edges that are fine: an idle window that never ends, and a watch with every default.
+  started.push(watchInbox(dir, { ...ok, idleMs: Infinity }), watchInbox(dir, { onRequest() {} }));
+  assert.ok(started.every(watch => typeof watch.stop === 'function'));
+});
