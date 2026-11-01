@@ -39,14 +39,19 @@
   // The tone marks and the vowels above and below a Thai letter, and Sara Am, belong to the grapheme of the letter before
   // them, so cutting by grapheme never leaves one stranded at the start of the rest.
   const segmenter = new Intl.Segmenter('th', { granularity: 'grapheme' });
+  // The Thai leading vowels เ แ โ ใ ไ (U+0E40 to U+0E44) are written before the consonant that they are read after, so a
+  // cut that ends on one leaves it without its consonant.
+  const DANGLING_VOWELS = /[เ-ไ]+$/;
 
   /**
    * The text cut to at most `max` graphemes: a longer text keeps its first `max` graphemes and gets an ellipsis (U+2026).
+   * Any Thai leading vowel at the end of what is kept is dropped first, and a max below 0 counts as 0.
    */
   function shortLabel(text, max = 28) {
     const whole = String(text ?? '');
     const graphemes = Array.from(segmenter.segment(whole), part => part.segment);
-    return graphemes.length > max ? `${graphemes.slice(0, max).join('')}…` : whole;
+    const limit = Math.max(0, max); // slice(0, -1) would count from the end
+    return graphemes.length > limit ? `${graphemes.slice(0, limit).join('').replace(DANGLING_VOWELS, '')}…` : whole;
   }
 
   /**
@@ -102,22 +107,43 @@
    * The key two expansion requests are compared by: node, direction and question. A missing, null and empty question are
    * the same question, and the id, the time and the status are not part of the key. This is the rule of queueKey in
    * scripts/lib/map.cjs, which the live server and the command-line tool dedupe by. The browser cannot require that file
-   * (it reads files), so the rule is repeated here and a test keeps the two equal.
+   * (it reads files), so the rule is repeated here and a test keeps the two equal. queueCounts compares a cleaned form
+   * of it (countKey), so this function stays the same as the one in map.cjs.
    */
   const queueKey = r => JSON.stringify([r.nodeId, r.direction, r.question ?? '']);
 
   /**
+   * A question in its one canonical text: every line break and run of white space becomes one space (so the text is one
+   * line), a double quote becomes a single quote, ";" becomes ",", and the ends are trimmed. null and undefined are the
+   * empty string. This is the text a question has in the --queue option (formatQueue, parseQueue) and the text
+   * queueCounts compares, and cleaning a clean question changes nothing.
+   * @param {string | null | undefined} question
+   * @returns {string}
+   */
+  const cleanQuestion = question => String(question ?? '')
+    .replace(/[\s\u0085]+/g, ' ') // \s is CR, LF, VT, FF, tab, U+2028, U+2029 and the other white space, but not NEL (U+0085)
+    .replace(/"/g, "'")
+    .replace(/;/g, ',')
+    .trim();
+
+  // What queueCounts matches requests by: queueKey with the question cleaned. A request chosen offline reaches map.queue
+  // through the --queue text, so its question comes back cleaned, while one the live server queues may hold the question
+  // as it was typed. Cleaning both sides makes every copy of a request match the local one.
+  const countKey = item => queueKey({ ...item, question: cleanQuestion(item.question) });
+
+  /**
    * The counts for the top bar. `researching` is the items of map.queue that are being researched. `pending` is the
    * items of map.queue that are waiting, plus each distinct request in localItems (chosen in this browser, not sent yet)
-   * that map.queue does not already hold under the same queueKey, whatever that item's status. A map with no queue has
-   * an empty one, and null localItems (what safeStorage gives for a missing key) is none.
+   * that map.queue does not already hold, whatever that item's status. Requests are the same when their node, direction
+   * and cleaned question (cleanQuestion) are. A map with no queue has an empty one, and null localItems (what
+   * safeStorage gives for a missing key) is none.
    * @param {Array<{ nodeId: string, direction: string, question?: string | null }> | null} [localItems]
    * @returns {{ researching: number, pending: number }}
    */
   function queueCounts(map, localItems) {
     const queued = map.queue ?? [];
-    const known = new Set(queued.map(queueKey));
-    const local = new Set((localItems ?? []).map(queueKey)); // the same request twice is one request
+    const known = new Set(queued.map(countKey));
+    const local = new Set((localItems ?? []).map(countKey)); // the same request twice is one request
     const unsent = [...local].filter(key => !known.has(key)).length;
     return {
       researching: queued.filter(item => item.status === 'researching').length,
@@ -125,17 +151,9 @@
     };
   }
 
-  // A question as it goes into the command: one line, and nothing that could end the --queue "..." text or an item.
-  const cleanQuestion = question => String(question ?? '')
-    .replace(/[\r\n\t]+/g, ' ')
-    .replace(/"/g, "'")
-    .replace(/;/g, ',')
-    .trim();
-
   /**
-   * The queue as the text of the --queue option: items joined with "; ", each one nodeId:direction[:question]. In a
-   * question a run of line breaks or tabs becomes one space, a double quote becomes a single quote, ";" becomes ",", and
-   * the ends are trimmed. An item with no question (absent, null or blank) has no third part.
+   * The queue as the text of the --queue option: items joined with "; ", each one nodeId:direction[:question]. The
+   * question is cleaned (cleanQuestion). An item with no question (absent, null or blank) has no third part.
    * @param {Array<{ nodeId: string, direction: string, question?: string | null }> | null} items
    * @returns {string}
    */
@@ -148,9 +166,11 @@
 
   /**
    * The inverse of formatQueue. The text is split at ";" and each item trimmed, and empty items are skipped, so a
-   * trailing "; " is fine. An item is cut at its first two colons only (a question may hold colons) and its parts are
-   * trimmed. An item without a question has no question key at all.
-   * @throws {Error} for an item with no node id, or whose direction is not one of the directions in DRShared
+   * trailing "; " is fine. An item is cut at its first two colons only (a question may hold colons), its node id and
+   * direction are trimmed and its question is cleaned (cleanQuestion), which changes nothing in text that formatQueue
+   * made. An item without a question has no question key at all.
+   * @throws {Error} for an item with no node id, one whose direction is not one of the directions in DRShared, or one
+   *   whose direction is "question" but that has no question text (validate.cjs rejects a queue item like that)
    * @returns {Array<{ nodeId: string, direction: string, question?: string }>}
    */
   function parseQueue(text) {
@@ -161,10 +181,13 @@
       const [id, dir = '', ...rest] = item.split(':'); // rest, put back together, is all that follows the second colon
       const nodeId = id.trim();
       const direction = dir.trim();
-      const question = rest.join(':').trim();
+      const question = cleanQuestion(rest.join(':'));
       if (nodeId === '') throw new Error(`queue item "${item}" has no node id`);
       if (!DIRECTION_IDS.includes(direction)) {
         throw new Error(`queue item "${item}" has unknown direction "${direction}" (use one of ${DIRECTION_IDS.join(', ')})`);
+      }
+      if (direction === 'question' && question === '') {
+        throw new Error(`queue item "${item}" has direction "question" but no question text`);
       }
       items.push(question === '' ? { nodeId, direction } : { nodeId, direction, question });
     }
@@ -215,6 +238,6 @@
 
   return {
     isExpandable, badgeFor, shortLabel, numberCites, pathTo, readingNav,
-    queueKey, queueCounts, formatQueue, parseQueue, buildQueueCommand, splitSides, safeStorage,
+    queueKey, cleanQuestion, queueCounts, formatQueue, parseQueue, buildQueueCommand, splitSides, safeStorage,
   };
 });

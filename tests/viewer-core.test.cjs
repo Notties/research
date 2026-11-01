@@ -82,6 +82,10 @@ test('badgeFor on the nodes of the fixture map', () => {
 
 // ---- shortLabel ----
 
+// The five Thai leading vowels, U+0E40 to U+0E44: each is written before the consonant that it is read after.
+const LEADING_VOWELS = Array.from({ length: 5 }, (_, i) => String.fromCharCode(0x0E40 + i));
+const endsWithLeadingVowel = text => LEADING_VOWELS.some(vowel => text.endsWith(vowel));
+
 test('shortLabel never splits a Thai grapheme', () => {
   const input = 'ที่นี่มีน้ำใจมากมาย';
   const out = C.shortLabel(input, 3);
@@ -92,16 +96,20 @@ test('shortLabel never splits a Thai grapheme', () => {
   assert.equal(C.shortLabel('สั้น', 28), 'สั้น');
 });
 
-test('shortLabel keeps every Thai mark with its letter at every cut', () => {
+test('shortLabel keeps every Thai mark with its letter, and ends on no leading vowel, at every cut', () => {
   const input = 'ที่นี่มีน้ำใจมากมาย'; // 12 graphemes: ที่ นี่ มี น้ำ ใ จ ม า ก ม า ย
   for (let max = 1; max < 12; max++) {
     const out = C.shortLabel(input, max);
     const kept = out.slice(0, -1);
     assert.ok(out.endsWith('…') && input.startsWith(kept), `max ${max}`);
     assert.ok(!/^\p{M}/u.test(input.slice(kept.length)), `max ${max}`);
+    assert.ok(!endsWithLeadingVowel(kept), `max ${max}`);
   }
   // Sara Am is a letter, not a mark, but it still belongs to the grapheme before it.
   assert.equal(C.shortLabel(input, 4), 'ที่นี่มีน้ำ…');
+  // At 5 the last kept letter would be the leading vowel ใ, which is read after the จ that follows it: it goes.
+  assert.equal(C.shortLabel(input, 5), 'ที่นี่มีน้ำ…');
+  assert.equal(C.shortLabel(input, 6), 'ที่นี่มีน้ำใจ…');
   assert.equal(C.shortLabel(input, 11), 'ที่นี่มีน้ำใจมากมา…');
 });
 
@@ -129,6 +137,37 @@ test('shortLabel: a surrogate pair is never cut', () => {
   const smile = String.fromCodePoint(0x1F600);
   assert.equal(C.shortLabel(smile.repeat(3), 3), smile.repeat(3));
   assert.equal(C.shortLabel(smile.repeat(3), 2), `${smile.repeat(2)}…`);
+});
+
+test('shortLabel drops a leading vowel that the cut leaves at the end, so no word ends on its first sign', () => {
+  assert.equal(C.shortLabel('ใช้เครื่องมือ', 3), 'ใช้…'); // ใ ช้ เ | ครื่องมือ: the เ is read after the ค that follows it
+  assert.equal(C.shortLabel('เกมส์สนุก', 1), '…'); // only the vowel was left
+  assert.equal(C.shortLabel('เกมส์สนุก', 2), 'เก…'); // a vowel kept with its consonant stays
+  assert.equal(C.shortLabel('เเกม', 2), '…'); // two in a row both go
+});
+
+test('shortLabel drops each of the five leading vowels, and no other character', () => {
+  for (const vowel of LEADING_VOWELS) {
+    assert.equal(C.shortLabel(`ก${vowel}ข`, 2), 'ก…', `U+${vowel.charCodeAt(0).toString(16)}`);
+  }
+  // The neighbours of the range stay: the baht sign U+0E3F, Lakkhangyao U+0E45 and the vowel Sara Aa U+0E32.
+  for (const code of [0x0E3F, 0x0E45, 0x0E32]) {
+    const ch = String.fromCharCode(code);
+    assert.equal(C.shortLabel(`ก${ch}ข`, 2), `ก${ch}…`, `U+${code.toString(16)}`);
+  }
+});
+
+test('shortLabel drops a leading vowel only when it cuts the text', () => {
+  assert.equal(C.shortLabel('ใช้เ', 3), 'ใช้เ'); // 3 graphemes at max 3: nothing is cut
+  assert.equal(C.shortLabel('เ', 28), 'เ');
+});
+
+test('shortLabel: a max below 1 keeps no text, and a negative max does not count from the end', () => {
+  assert.equal(C.shortLabel('abc', 0), '…');
+  assert.equal(C.shortLabel('abc', -1), '…');
+  assert.equal(C.shortLabel('ที่นี่', -5), '…');
+  assert.equal(C.shortLabel('', 0), '');
+  assert.equal(C.shortLabel('', -1), '');
 });
 
 // ---- numberCites ----
@@ -248,6 +287,8 @@ test('readingNav follows the reading path of the fixture map', () => {
 
 const ISO = '2026-11-01T00:00:00.000Z';
 const queued = (id, nodeId, direction, status, extra) => ({ id, nodeId, direction, at: ISO, status, ...extra });
+const BRIEF = { goal: 'สร้างงาน', level: 'ไม่รู้เลย', focus: '', exclude: '', depth: 'standard', constraints: '' };
+const freshMap = () => createMap({ topic: 'ทดสอบ', slug: 'test-topic', brief: BRIEF });
 
 test('queueKey is the rule of scripts/lib/map.cjs', () => {
   const requests = [
@@ -334,8 +375,7 @@ test('queueCounts counts only the statuses the queue has', () => {
 });
 
 test('queueCounts reads the queue items scripts/lib/map.cjs produces', () => {
-  const brief = { goal: 'สร้างงาน', level: 'ไม่รู้เลย', focus: '', exclude: '', depth: 'standard', constraints: '' };
-  const map = createMap({ topic: 'ทดสอบ', slug: 'test-topic', brief });
+  const map = freshMap();
   acceptRequests(map, [
     { id: 'r-1', nodeId: 'g-know-1', direction: 'detail', at: ISO },
     { id: 'r-2', nodeId: 'g-do-1', direction: 'question', question: 'ทำไม', at: ISO },
@@ -345,6 +385,89 @@ test('queueCounts reads the queue items scripts/lib/map.cjs produces', () => {
   const both = [{ nodeId: 'g-know-1', direction: 'detail' }, { nodeId: 'g-do-1', direction: 'question', question: 'ทำไม' }];
   assert.deepEqual(C.queueCounts(map, both), { researching: 1, pending: 1 });
   assert.deepEqual(C.queueCounts(map, [...both, { nodeId: 'g-see-1', direction: 'examples' }]), { researching: 1, pending: 2 });
+});
+
+// Questions that formatQueue rewrites: a request chosen offline reaches map.queue as text, so it comes back cleaned.
+const REWRITTEN = [
+  ['a double quote', 'ราคา "จริง" เท่าไร'],
+  ['a semicolon', 'ราคาเท่าไร; ปี 2026'],
+  ['surrounding spaces', '  ราคาเท่าไร  '],
+  ['two lines', 'ราคาเท่าไร\nปี 2026'],
+];
+
+test('queueCounts: a local request is not counted again once queued, though its question was rewritten on the way', () => {
+  for (const [what, question] of REWRITTEN) {
+    const local = { nodeId: 'g-do-1', direction: 'question', question };
+    const map = freshMap();
+    // The offline path: the --queue text is parsed back into requests, and accept queues them.
+    const requests = C.parseQueue(C.formatQueue([local])).map((r, i) => ({ id: `r-${i + 1}`, ...r, at: ISO }));
+    acceptRequests(map, requests);
+    assert.equal(map.queue.length, 1, what);
+    assert.notEqual(map.queue[0].question, question, `${what}: the queued question is not the typed one`);
+    assert.deepEqual(C.queueCounts(map, [local]), { researching: 0, pending: 1 }, what);
+    startItem(map, 'r-1');
+    assert.deepEqual(C.queueCounts(map, [local]), { researching: 1, pending: 0 }, `${what}, once researching`);
+  }
+});
+
+test('queueCounts: a queued item that holds the raw question matches the same raw local item (the live path)', () => {
+  for (const [what, question] of REWRITTEN) {
+    const map = { queue: [queued('q1', 'g-do-1', 'question', 'pending', { question })] };
+    const local = { nodeId: 'g-do-1', direction: 'question', question };
+    assert.deepEqual(C.queueCounts(map, [local]), { researching: 0, pending: 1 }, what);
+    const cleaned = { ...local, question: C.cleanQuestion(question) };
+    assert.deepEqual(C.queueCounts(map, [cleaned]), { researching: 0, pending: 1 }, `${what}, local one cleaned`);
+  }
+});
+
+test('queueCounts: local requests whose cleaned questions are equal are one request', () => {
+  const local = question => ({ nodeId: 'g-do-1', direction: 'question', question });
+  assert.deepEqual(C.queueCounts({ queue: [] }, [local('ก "ข"'), local("ก 'ข'"), local("  ก  'ข' ")]), { researching: 0, pending: 1 });
+  assert.deepEqual(C.queueCounts({ queue: [] }, [local('ก; ข'), local('ก, ข'), local('ก,\nข')]), { researching: 0, pending: 1 });
+  assert.deepEqual(C.queueCounts({ queue: [] }, [local('ก "ข"'), local('ก ค')]), { researching: 0, pending: 2 });
+});
+
+test('queueCounts: a blank question is no question', () => {
+  const map = { queue: [queued('q1', 'g-do-1', 'detail', 'pending')] };
+  assert.deepEqual(C.queueCounts(map, [{ nodeId: 'g-do-1', direction: 'detail', question: ' \n ' }]), { researching: 0, pending: 1 });
+});
+
+// ---- cleanQuestion ----
+
+const NEL = String.fromCharCode(0x85);
+const LS = String.fromCharCode(0x2028);
+const PS = String.fromCharCode(0x2029);
+// Every character that ends a line for some reader: CR, LF, VT, FF, NEL, the line separator and the paragraph separator.
+const LINE_BREAKS = ['\r', '\n', '\v', '\f', NEL, LS, PS];
+const hex = ch => `U+${ch.charCodeAt(0).toString(16).toUpperCase().padStart(4, '0')}`;
+
+test('cleanQuestion: null and undefined give the empty string', () => {
+  assert.equal(C.cleanQuestion(null), '');
+  assert.equal(C.cleanQuestion(undefined), '');
+  assert.equal(C.cleanQuestion(''), '');
+});
+
+test('cleanQuestion: a double quote becomes a single quote, ";" becomes ",", the ends are trimmed, a colon stays', () => {
+  assert.equal(C.cleanQuestion('  ราคา "จริง"; เท่าไร; "ครับ"  '), "ราคา 'จริง', เท่าไร, 'ครับ'");
+  assert.equal(C.cleanQuestion('ทำไม: ช่วยอธิบาย'), 'ทำไม: ช่วยอธิบาย');
+});
+
+test('cleanQuestion: each line break, and each run of white space, becomes one space', () => {
+  for (const brk of LINE_BREAKS) {
+    assert.equal(C.cleanQuestion(`ก${brk}ข`), 'ก ข', hex(brk));
+    assert.equal(C.cleanQuestion(`ก${brk}${brk}${brk}ข`), 'ก ข', `${hex(brk)} run`);
+    assert.equal(C.cleanQuestion(`${brk}${brk}ก${brk}`), 'ก', `${hex(brk)} at the ends`);
+  }
+  assert.equal(C.cleanQuestion(`ก${LINE_BREAKS.join('')}\t ข`), 'ก ข'); // every kind in one run
+  assert.equal(C.cleanQuestion('ก    ข'), 'ก ข'); // plain spaces are folded too
+  assert.equal(C.cleanQuestion('\t'), '');
+});
+
+test('cleanQuestion is idempotent, so text that is already clean comes back as it was', () => {
+  for (const question of ['ราคา "จริง"; เท่าไร\n', '  a\t\tb  ', 'x;y"z', 'ทำไม: ช่วยอธิบาย', `a${NEL}${LS}b`, '']) {
+    const once = C.cleanQuestion(question);
+    assert.equal(C.cleanQuestion(once), once, JSON.stringify(question));
+  }
 });
 
 // ---- formatQueue, parseQueue and buildQueueCommand ----
@@ -395,11 +518,12 @@ test('formatQueue: an item with no usable question has no third part', () => {
 });
 
 test('formatQueue: one item per line of text, whatever the questions hold', () => {
+  const broken = LINE_BREAKS.map((brk, i) => `บรรทัด${i}${brk}`).join(''); // one of each kind of line break
   const out = C.formatQueue([
-    { nodeId: 'a', direction: 'question', question: 'บรรทัดแรก\nบรรทัดสอง\r\nบรรทัดสาม\tแท็บ' },
+    { nodeId: 'a', direction: 'question', question: `บรรทัดแรก\nบรรทัดสอง\r\nบรรทัดสาม\tแท็บ${broken}` },
     { nodeId: 'b', direction: 'question', question: '"quoted"; and more' },
   ]);
-  assert.ok(!/[\r\n\t]/.test(out), JSON.stringify(out));
+  for (const brk of [...LINE_BREAKS, '\t']) assert.ok(!out.includes(brk), `${hex(brk)} in ${JSON.stringify(out)}`);
   assert.ok(!out.includes('"'), out);
   assert.equal(out.split('; ').length, 2, out);
 });
@@ -447,13 +571,30 @@ test('parseQueue throws on an item with no direction or no node id', () => {
   assert.throws(() => C.parseQueue('  :detail:ทำไม'), /node id/);
 });
 
-test('parseQueue accepts every direction in shared.js', () => {
-  for (const { id } of S.DIRECTIONS) assert.deepEqual(C.parseQueue(`n:${id}`), [{ nodeId: 'n', direction: id }], id);
+test('parseQueue accepts every direction in shared.js, and all but the question direction without a question', () => {
+  for (const { id } of S.DIRECTIONS) {
+    assert.deepEqual(C.parseQueue(`n:${id}:ทำไม`), [{ nodeId: 'n', direction: id, question: 'ทำไม' }], id);
+    if (id !== 'question') assert.deepEqual(C.parseQueue(`n:${id}`), [{ nodeId: 'n', direction: id }], id);
+  }
 });
 
-test('formatQueue then parseQueue round-trips every direction, with and without a question', () => {
+test('parseQueue throws for the question direction with no question text', () => {
+  // validate.cjs rule 14 rejects a queue item like that, so it must not get as far as the inbox
+  const blank = ['x:question', 'x:question:', 'x:question:   ', `x:question:${NEL}`, `x:question:\t${LS}\r\n${PS}`];
+  for (const text of blank) assert.throws(() => C.parseQueue(text), /no question text/, JSON.stringify(text));
+  assert.throws(() => C.parseQueue('a:detail; b:question; c:examples'), /b:question/); // it names the item
+  assert.deepEqual(C.parseQueue('x:question:?'), [{ nodeId: 'x', direction: 'question', question: '?' }]);
+});
+
+test('parseQueue returns the question cleaned the way formatQueue cleans it', () => {
+  assert.deepEqual(C.parseQueue('a:question:  ทำไม \t\n แพง  '), [{ nodeId: 'a', direction: 'question', question: 'ทำไม แพง' }]);
+  assert.deepEqual(C.parseQueue('a:examples:ทำไม "แพง"'), [{ nodeId: 'a', direction: 'examples', question: "ทำไม 'แพง'" }]);
+  assert.deepEqual(C.parseQueue(`a:examples:${NEL}`), [{ nodeId: 'a', direction: 'examples' }]); // nothing is left of it
+});
+
+test('formatQueue then parseQueue round-trips every direction, with a question and, where allowed, without', () => {
   const items = S.DIRECTIONS.flatMap(d => [
-    { nodeId: 'g-1', direction: d.id },
+    ...(d.id === 'question' ? [] : [{ nodeId: 'g-1', direction: d.id }]), // the question direction needs its text
     { nodeId: 'g-2-1', direction: d.id, question: 'ทำไมถึงแพง: ช่วยอธิบาย' },
   ]);
   assert.deepEqual(C.parseQueue(C.formatQueue(items)), items);
@@ -595,13 +736,18 @@ test('safeStorage works from memory alone for a null or undefined storage', () =
   }
 });
 
-test('safeStorage: get gives a fresh copy, whether it came from the storage or from memory', () => {
-  for (const storage of [fakeStorage(), null]) {
-    const s = C.safeStorage(storage);
-    s.set('k', [1]);
+test('safeStorage: get gives a fresh copy each time, from memory and from the storage', () => {
+  const storage = fakeStorage();
+  const memoryOnly = C.safeStorage(null);
+  const writer = C.safeStorage(storage);
+  memoryOnly.set('k', [1]);
+  writer.set('k', [1]);
+  const reader = C.safeStorage(storage); // a later page load: its memory is empty, so get reads the storage
+  for (const [name, s] of [['memory only', memoryOnly], ['write-through memory', writer], ['storage', reader]]) {
     s.get('k').push(2);
-    assert.deepEqual(s.get('k'), [1]);
+    assert.deepEqual(s.get('k'), [1], name);
   }
+  assert.equal(storage.data.get('k'), '[1]');
 });
 
 test('safeStorage: setting undefined stores null, never the text "undefined"', () => {
@@ -615,10 +761,10 @@ test('safeStorage: setting undefined stores null, never the text "undefined"', (
 
 // ---- the file itself ----
 
-test('exports the 12 functions of the plan and queueKey, nothing else', () => {
+test('exports the 12 functions of the plan, queueKey and cleanQuestion, nothing else', () => {
   assert.deepEqual(Object.keys(C).sort(), [
-    'badgeFor', 'buildQueueCommand', 'formatQueue', 'isExpandable', 'numberCites', 'parseQueue', 'pathTo',
-    'queueCounts', 'queueKey', 'readingNav', 'safeStorage', 'shortLabel', 'splitSides',
+    'badgeFor', 'buildQueueCommand', 'cleanQuestion', 'formatQueue', 'isExpandable', 'numberCites', 'parseQueue',
+    'pathTo', 'queueCounts', 'queueKey', 'readingNav', 'safeStorage', 'shortLabel', 'splitSides',
   ]);
   for (const [name, fn] of Object.entries(C)) assert.equal(typeof fn, 'function', name);
 });
