@@ -157,6 +157,7 @@ const readMap = dir => JSON.parse(fs.readFileSync(inFolder(dir, 'map.json'), 'ut
 const writeMap = (dir, map) => fs.writeFileSync(inFolder(dir, 'map.json'), `${JSON.stringify(map, null, 2)}\n`);
 const readPage = dir => fs.readFileSync(inFolder(dir, 'index.html'), 'utf8');
 const bytesOf = (dir, name) => fs.readFileSync(inFolder(dir, name));
+const textIfThere = file => { try { return fs.readFileSync(file, 'utf8'); } catch { return null; } };
 const listing = dir => fs.readdirSync(dir).sort();
 const addToInbox = (dir, ...requests) => fs.appendFileSync(inFolder(dir, 'inbox.jsonl'), requests.map(r => `${JSON.stringify(r)}\n`).join(''));
 const request = extra => ({ id: 'r-1', nodeId: 'g-know-1', direction: 'detail', at: NOW, ...extra });
@@ -293,8 +294,8 @@ function unstatableMap() {
   };
 }
 
-// Between a command judging the lock stale and holding the break file, another command broke the lock and took a fresh one. Here that
-// happens at the moment the break file is made, once.
+// Between a command judging the lock stale and holding the break file, another command broke the lock and took a fresh one, whose text is
+// in DR_TEST_NEW_LOCK. Here that happens at the moment the break file is made, once.
 function lockRetaken() {
   const fs = require('node:fs');
   const write = fs.writeFileSync;
@@ -305,9 +306,34 @@ function lockRetaken() {
       done = true;
       const lock = String(file).replace(/\.break$/, '');
       fs.rmSync(lock, { force: true });
-      write(lock, '4321\nthe-new-holders-token\n', { flag: 'wx' });
+      write(lock, process.env.DR_TEST_NEW_LOCK, { flag: 'wx' });
     }
     return result;
+  };
+}
+
+// Every attempt to make the break file adds a line to the file that DR_TEST_NOTE names. A command that has to wait for the break file
+// does nothing else that can be seen from outside, so this is the one sign that it is there and retrying.
+function noteBreakAttempts() {
+  const fs = require('node:fs');
+  const write = fs.writeFileSync;
+  fs.writeFileSync = function notingWrite(file, data, options) {
+    if (String(file).endsWith('map.json.lock.break') && options?.flag === 'wx') fs.appendFileSync(process.env.DR_TEST_NOTE, 'attempt\n');
+    return write.apply(this, arguments);
+  };
+}
+
+// Removing the lock file is refused with EPERM unless the call asks for retries. That is the model of a refusal that passes within
+// moments, as Windows gives while something has the file open: rmSync with maxRetries tries again, and one without them fails at the
+// first. The retrying itself is node's, so the stub only tells a call that has retries from one that has none.
+function transientRemoveRefusal() {
+  const fs = require('node:fs');
+  const remove = fs.rmSync;
+  fs.rmSync = function transientRemove(file, options) {
+    if (String(file).endsWith('map.json.lock') && !(options?.maxRetries >= 1)) {
+      throw Object.assign(new Error(`EPERM: operation not permitted, unlink '${file}'`), { code: 'EPERM', syscall: 'unlink', path: file });
+    }
+    return remove.apply(this, arguments);
   };
 }
 
@@ -1349,13 +1375,18 @@ test('a stale lock is broken only by the command that holds the break file, and 
   const w = initialized(t);
   const lock = inFolder(w.dir, 'map.json.lock');
   const breaking = inFolder(w.dir, 'map.json.lock.break');
+  const note = path.join(w.work, 'break-attempts.txt');
+  const attempts = () => (textIfThere(note) ?? '').split('\n').filter(Boolean).length;
   makeStale(lock, '4242\n');
   fs.writeFileSync(breaking, '5151\n'); // another command is breaking that lock right now
   let settled = false;
-  const run = drAsync(['mark-checked', w.dir]).finally(() => { settled = true; });
-  await sleep(700); // far more than a child needs to start: it is retrying now
+  const run = drAsync(['mark-checked', w.dir], preload(w, noteBreakAttempts, { DR_TEST_NOTE: note })).finally(() => { settled = true; });
+  // No pause says how far a command has got, since a loaded machine can take seconds to start one. What does: it has tried to break the
+  // lock three times, retrying as it does every 50 ms, and each time the break file was not its to take. Only then is "it did not go on
+  // and the lock is untouched" about a command that was there and was held back. (If it goes on at once, that ends this wait too.)
+  await waitFor(() => settled || attempts() >= 3, 'three attempts to take the break file');
   assert.equal(settled, false, 'it went on while another command was breaking the lock');
-  assert.equal(fs.readFileSync(lock, 'utf8'), '4242\n', 'the stale lock is not its to remove');
+  assert.equal(textIfThere(lock), '4242\n', 'the stale lock is not its to remove');
   fs.rmSync(breaking); // the other command is done, and has left the lock as it was
   const result = await run;
   assert.equal(result.status, 0, result.stdout + result.stderr);
@@ -1365,16 +1396,34 @@ test('a stale lock is broken only by the command that holds the break file, and 
 test('a command that holds the break file and finds a fresh lock in place of the stale one it judged leaves that lock alone', async t => {
   const w = initialized(t);
   const lock = inFolder(w.dir, 'map.json.lock');
+  const breaking = inFolder(w.dir, 'map.json.lock.break');
+  const newLock = '4321\nthe-new-holders-token\n';
   makeStale(lock, '4242\n');
   // The stub swaps the stale lock for a fresh one as the break file is made: another command broke it and took a new one in between.
   let settled = false;
-  const run = drAsync(['mark-checked', w.dir], preload(w, lockRetaken)).finally(() => { settled = true; });
-  await sleep(700);
+  const run = drAsync(['mark-checked', w.dir], preload(w, lockRetaken, { DR_TEST_NEW_LOCK: newLock })).finally(() => { settled = true; });
+  // How far the command has got is the whole question, and no pause tells it: a loaded machine can take seconds to start a process. The end
+  // of its break step does: the swapped lock is there, and the break file, which the command removes once it has decided what to do about
+  // the lock, is gone. If it removed the swapped lock it goes on and finishes instead, and that ends this wait too, as a failure below.
+  await waitFor(() => settled || (textIfThere(lock) === newLock && !fs.existsSync(breaking)), 'the end of its break step');
   assert.equal(settled, false, 'it went on, so it removed a lock that was not the one it judged');
-  assert.equal(fs.readFileSync(lock, 'utf8'), '4321\nthe-new-holders-token\n', 'the fresh lock of the other command is still there');
+  assert.equal(textIfThere(lock), newLock, 'the fresh lock of the other command is still there');
+  await sleep(300); // a short settle: all that is left to show is that it keeps waiting for that lock
+  assert.equal(settled, false, 'it did not wait for the lock that was in place');
+  assert.equal(textIfThere(lock), newLock);
   fs.rmSync(lock); // the other command is done
   const result = await run;
   assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.deepEqual(listing(w.dir), TOPIC_FILES);
+});
+
+test('a stale lock is removed with retries, so that a refusal that passes within moments does not abort the command', t => {
+  const w = initialized(t);
+  makeStale(inFolder(w.dir, 'map.json.lock'), '4242\n');
+  const run = dr(['mark-checked', w.dir], preload(w, transientRemoveRefusal));
+  assert.equal(run.status, 0, run.stdout + run.stderr);
+  assert.deepEqual(run.json, { changed: 0 });
+  assert.equal(run.stderr, '');
   assert.deepEqual(listing(w.dir), TOPIC_FILES);
 });
 
@@ -1421,6 +1470,7 @@ test('a lock that cannot be removed does not turn a command that finished into a
   assert.equal(run.status, 0, run.stdout + run.stderr);
   assert.deepEqual(run.json, { added: ['g-know-1-1', 'g-know-1-2'] }); // told, so that nobody merges the fragment a second time
   assert.match(run.stderr, /^dr\.cjs: warning: could not remove map\.json\.lock \(EPERM\)/);
+  assert.match(run.stderr, /the next command waits 10 s for it and then fails, and the first one after 30 s breaks it\n$/, 'what the next command will meet');
   assert.equal(findNode(readMap(w.dir), 'g-know-1').children.length, 2, 'the fragment was saved once');
   assert.ok(fs.existsSync(inFolder(w.dir, 'map.json.lock')), 'it is the lock that stayed');
 });

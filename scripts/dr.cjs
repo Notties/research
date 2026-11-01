@@ -180,6 +180,9 @@ const LOCK_WAIT_MS = 10000;
 const LOCK_STALE_MS = 30000;
 // Why a lock cannot be taken right now: it exists (EEXIST), or Windows is in the middle of deleting it (EPERM, EACCES, EBUSY).
 const LOCK_BUSY = ['EEXIST', 'EPERM', 'EACCES', 'EBUSY'];
+// How a lock file is deleted, by the command that releases it and by one that breaks a stale one: Windows can refuse a delete for a moment
+// while something has the file open (EPERM, EBUSY), and rmSync tries again with these.
+const REMOVE_LOCK = { force: true, maxRetries: 5, retryDelay: 20 };
 const pause = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); // a synchronous sleep
 const warn = text => process.stderr.write(`dr.cjs: warning: ${text}\n`);
 
@@ -220,7 +223,7 @@ function breakStaleLock(lock) {
   }
   try {
     const now = lockStat(lock);
-    if (now !== null && now.mark === judged.mark && now.age > LOCK_STALE_MS) fs.rmSync(lock, { force: true });
+    if (now !== null && now.mark === judged.mark && now.age > LOCK_STALE_MS) fs.rmSync(lock, REMOVE_LOCK);
   } finally {
     try { fs.rmSync(breaking, { force: true }); } catch { /* a break file that stays is stale after 30 s */ }
   }
@@ -254,10 +257,13 @@ function releaseLock(lock, token) {
       warn(`${LOCK_FILE} was taken over while this command held it, since a lock is broken after ${LOCK_STALE_MS / 1000} s, `
         + 'so it was left alone; what this command saved may have been overwritten');
     } else {
-      fs.rmSync(lock, { force: true, maxRetries: 5, retryDelay: 20 });
+      fs.rmSync(lock, REMOVE_LOCK);
     }
   } catch (err) {
-    warn(`could not remove ${LOCK_FILE} (${err.code ?? err.message}); the next command waits for it, for at most ${LOCK_STALE_MS / 1000} s`);
+    // The next command meets a lock that is not stale yet: it waits LOCK_WAIT_MS for it and then fails, and the first one to come after
+    // LOCK_STALE_MS breaks it.
+    warn(`could not remove ${LOCK_FILE} (${err.code ?? err.message}); the next command waits ${LOCK_WAIT_MS / 1000} s for it and then fails, `
+      + `and the first one after ${LOCK_STALE_MS / 1000} s breaks it`);
   }
 }
 
