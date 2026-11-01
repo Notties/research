@@ -11,14 +11,15 @@
 //   init           {"dir"}                                     render        {"rendered"}: the path of index.html
 //   validate       {"ok":true}                                 merge         {"added"}: the new node ids
 //   mark-checked   {"changed"}: how many nodes moved on        check-urls    {"ok":true,"checked"}
+//   synthesize     {"updated":[the keys applied]}
 //   accept         {"accepted":[queue items],"skipped":[{"request","reason"}]}
 //   start          {"started": the queue item}                 finish        {"finished": the item id}
 //   enqueue        {"appended":[requests],"skipped":[{"request","reason"}]}
 //   serve          {"type":"server-started","url"} ... {"type":"server-stopped","reason":"idle"|"closed"}
 //   watch          {"type":"expand", ...the request} for each request ... {"type":"idle"}
 //
-// Writing: the commands that write a topic (init, render, merge, mark-checked, accept, start, finish) take the lock file
-// map.json.lock first. Without it two of them could load the map, change it and save it at the same moment, and one would
+// Writing: the commands that write a topic (init, render, merge, synthesize, mark-checked, accept, start, finish) take the lock
+// file map.json.lock first. Without it two of them could load the map, change it and save it at the same moment, and one would
 // lose the other's changes. The others (validate, check-urls, enqueue, serve, watch) only read, or only append to inbox.jsonl.
 // Anything else that writes map.json, an edit by hand say, does not take the lock, so it must not overlap one of these commands.
 // Failing: a request that cannot be met (usage, validation, a node that is not there) prints only its error line. A bug or an
@@ -51,7 +52,9 @@ const DIRECTION_IDS = S.DIRECTIONS.map(d => d.id);
 const MS_PER_MINUTE = 60000;
 
 const isObj = v => typeof v === 'object' && v !== null && !Array.isArray(v);
+const isText = v => typeof v === 'string' && v.trim() !== '';
 const stripBom = text => (text.charCodeAt(0) === 0xfeff ? text.slice(1) : text);
+const unknownNode = id => `unknown node "${id}"`;
 
 // ---- output and failure ----
 
@@ -287,7 +290,7 @@ define(
   },
 );
 
-// render, validate, merge, mark-checked, check-urls
+// render, validate, merge, synthesize, mark-checked, check-urls
 
 define('render', 'render <dir>', { args: ['dir'] }, ([dir]) => withLock(dir, () => ({
   rendered: writeIndexHtml(dir, loadTopic(dir), { live: false }),
@@ -314,6 +317,53 @@ define(
   },
 );
 
+// synthesize: the fields of the map that no merge reaches. A fragment's `self` sets node fields only, and it also turns the node into
+// checking and stamps researchedAt, so the summary, the reading path and a node's forYou are written here, with no node's status or
+// researchedAt touched. SYNTHESIS_KEYS is also the order in which the applied keys are reported.
+
+const SYNTHESIS_KEYS = ['summary', 'readingPath', 'forYou', 'rootSummary'];
+const quoted = names => names.map(name => `"${name}"`).join(', ');
+
+// The keys the file asks for, in SYNTHESIS_KEYS order, once everything about the file that needs no map has been checked. The
+// validator looks at summary and readingPath after they are applied, but it does not look at forYou or at a node's summary.
+function synthesisKeys(data) {
+  if (!isObj(data)) throw new CliError('the synthesis file must hold a JSON object');
+  const unknown = Object.keys(data).filter(key => !SYNTHESIS_KEYS.includes(key));
+  if (unknown.length > 0) {
+    throw new CliError(`unknown ${unknown.length === 1 ? 'key' : 'keys'} ${quoted(unknown)} in the synthesis file (use ${SYNTHESIS_KEYS.join(', ')})`);
+  }
+  const keys = SYNTHESIS_KEYS.filter(key => Object.hasOwn(data, key));
+  if (keys.length === 0) throw new CliError(`the synthesis file is empty: give at least one of ${SYNTHESIS_KEYS.join(', ')}`);
+  if (keys.includes('forYou')) {
+    if (!isObj(data.forYou)) throw new CliError('forYou must be an object of node id to text');
+    for (const [id, text] of Object.entries(data.forYou)) if (!isText(text)) throw new CliError(`forYou "${id}" must be non-empty text`);
+  }
+  if (keys.includes('rootSummary') && !isText(data.rootSummary)) throw new CliError('rootSummary must be non-empty text');
+  return keys;
+}
+
+define(
+  'synthesize',
+  'synthesize <dir> --file <synthesis.json>',
+  { args: ['dir'], values: ['file'], required: ['file'] },
+  ([dir], { file }) => {
+    const data = readJson(file, 'synthesis file');
+    const keys = synthesisKeys(data);
+    return update(dir, map => {
+      const forYou = Object.entries(data.forYou ?? {});
+      const missing = forYou.map(([id]) => id).filter(id => findNode(map, id) === null);
+      if (missing.length > 0) throw new CliError(`forYou: ${missing.map(unknownNode).join(', ')}`);
+      if (keys.includes('summary')) map.summary = data.summary;
+      if (keys.includes('readingPath')) map.readingPath = data.readingPath;
+      for (const [id, text] of forYou) findNode(map, id).forYou = text;
+      if (keys.includes('rootSummary')) map.root.summary = data.rootSummary;
+      const { ok, errors } = validateMap(map);
+      if (!ok) throw new CliError('the synthesis does not validate, so nothing was saved', { errors });
+      return { updated: keys };
+    });
+  },
+);
+
 define('mark-checked', 'mark-checked <dir>', { args: ['dir'] }, ([dir]) => update(dir, map => ({ changed: markChecked(map) })));
 
 define('check-urls', 'check-urls <dir>', { args: ['dir'] }, async ([dir]) => {
@@ -324,8 +374,6 @@ define('check-urls', 'check-urls <dir>', { args: ['dir'] }, async ([dir]) => {
 });
 
 // accept
-
-const unknownNode = id => `unknown node "${id}"`;
 
 // Why a request from the inbox must not be queued, or null. map.cjs finds a queue item by its id, and validate.cjs rejects a
 // queue item for a node that is not there, an unknown direction, or a "question" with no text, so a request like that would
@@ -406,8 +454,13 @@ define(
 
 let shutdown = () => {}; // what a command that keeps running must undo for the process to end after a failure
 
-// Starts the live server on the first free port from `port` on: that port and the 10 after it, moving on only when one is in use.
-// An option the server refuses (port 80, an idle time out of range) is a failure of its own, not a reason to try the next port.
+// Why a port cannot be had, and the next one may be: it is in use (EADDRINUSE), or the system keeps it for itself (EACCES: Windows
+// answers it for a port in an excluded range, such as one Hyper-V keeps, and Linux for a port below 1024 to anyone but root).
+const PORT_UNAVAILABLE = ['EADDRINUSE', 'EACCES'];
+
+// Starts the live server on the first usable port from `port` on: that port and the 10 after it, moving on only for a port that is
+// unavailable. An option the server refuses (port 80, an idle time out of range) is a failure of its own, not a reason to try the
+// next port, and so is any other error of the system.
 async function startOnFreePort(dir, port, idleMs) {
   const ports = [port];
   if (port !== 0) for (let next = port + 1; next < port + PORTS_TRIED && next <= 65535; next++) ports.push(next);
@@ -415,12 +468,13 @@ async function startOnFreePort(dir, port, idleMs) {
     try {
       return await startServer({ dir, port: candidate, idleMs });
     } catch (err) {
-      if (err.code === 'EADDRINUSE') continue;
+      if (PORT_UNAVAILABLE.includes(err.code)) continue;
       if (err instanceof RangeError) throw new CliError(err.message);
       throw err;
     }
   }
-  throw new CliError(ports.length === 1 ? `port ${ports[0]} is in use` : `ports ${ports[0]}-${ports.at(-1)} are all in use`);
+  const unusable = 'in use or reserved by the system';
+  throw new CliError(ports.length === 1 ? `port ${ports[0]} is ${unusable}` : `ports ${ports[0]}-${ports.at(-1)} are all ${unusable}`);
 }
 
 define(

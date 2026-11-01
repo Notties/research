@@ -11,8 +11,8 @@ const { findNode } = require('../scripts/lib/map.cjs');
 const { appendRequest } = require('../scripts/lib/inbox.cjs');
 
 // The seven tests that carry the plan's names come from the plan. The others pin what the rulings and the dispatch notes add:
-// the one JSON line every command prints and the exit codes SKILL.md reads, the lock around every write to a topic, what accept
-// and enqueue refuse, the inbox offset, and how serve and watch start, move on, idle and fail. Every command runs as a child
+// the one JSON line every command prints and the exit codes SKILL.md reads, the lock around every write to a topic, what accept,
+// enqueue and synthesize refuse, the inbox offset, and how serve and watch start, move on, idle and fail. Every command runs as a child
 // process of this one (process.execPath), and every test has its own temp --root under os.tmpdir(), so nothing here touches
 // C:\_research. A child that keeps running (serve, watch) is killed when its test ends, whether it passed or not. Every child has
 // a time limit and every test waits at most a minute, so a hang fails the run instead of freezing it.
@@ -63,10 +63,12 @@ function dr(args, { input, cwd } = {}) {
   return outcome(run.status, run.stdout, run.stderr);
 }
 // The same, without blocking this process: for a command that talks to a server in this process (check-urls) and for commands
-// that run side by side.
-function drAsync(args, { input } = {}) {
+// that run side by side. nodeArgs go to node before the script (--require, say), env is added to the environment of the child.
+function drAsync(args, { input, nodeArgs = [], env } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [DR, ...args], { stdio: ['pipe', 'pipe', 'pipe'], timeout: 60000, killSignal: 'SIGKILL' });
+    const child = spawn(process.execPath, [...nodeArgs, DR, ...args], {
+      stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, ...env }, timeout: 60000, killSignal: 'SIGKILL',
+    });
     let stdout = '';
     let stderr = '';
     child.stdout.setEncoding('utf8');
@@ -82,9 +84,11 @@ function drAsync(args, { input } = {}) {
   });
 }
 // Starts a command that keeps running and collects what it prints as it goes: `lines` (parsed), `raw` (the text), `stderr`, and
-// `exit`, a promise of { code, signal }. next(match) waits for a line that satisfies `match`.
-function spawnDr(t, args) {
-  const child = spawn(process.execPath, [DR, ...args], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 60000, killSignal: 'SIGKILL' });
+// `exit`, a promise of { code, signal }. next(match) waits for a line that satisfies `match`. nodeArgs and env as for drAsync.
+function spawnDr(t, args, { nodeArgs = [], env } = {}) {
+  const child = spawn(process.execPath, [...nodeArgs, DR, ...args], {
+    stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, ...env }, timeout: 60000, killSignal: 'SIGKILL',
+  });
   const run = { raw: '', stderr: '', lines: [], exited: false };
   let pending = '';
   child.stdout.setEncoding('utf8');
@@ -363,9 +367,10 @@ test('validate exit codes', t => {
 test('every command that reads a topic reports a folder with no usable map.json', t => {
   const w = workspace(t);
   const file = writeJson(path.join(w.work, 'fragment.json'), fragment());
+  const synthesisFile = writeJson(path.join(w.work, 'synthesis.json'), { rootSummary: 'สรุป' });
   const commands = [
     ['validate'], ['render'], ['mark-checked'], ['accept'], ['check-urls'], ['start', 'r-1'], ['finish', 'r-1'], ['watch'], ['serve'],
-    ['enqueue', '--queue', 'g-know-1:detail'], ['merge', '--parent', 'g-know-1', '--fragment', file],
+    ['enqueue', '--queue', 'g-know-1:detail'], ['merge', '--parent', 'g-know-1', '--fragment', file], ['synthesize', '--file', synthesisFile],
   ];
   const run = (dir, [name, ...rest]) => dr([name, dir, ...rest]);
 
@@ -495,6 +500,178 @@ test('mark-checked turns checking nodes into done (with children) or frontier (w
   assert.ok(readPage(w.dir).includes('"status":"frontier"'), 'the page shows the new statuses');
   assert.deepEqual(dr(['mark-checked', w.dir]).json, { changed: 0 });
   assert.deepEqual(listing(w.dir), TOPIC_FILES);
+});
+
+// ---- synthesize ----
+
+// A topic with research in it: the fragment merged under g-know-1 and then checked, so that g-know-1 is done and its two children
+// are frontier. A merge with a `self` would turn them back into checking, and that is what synthesize must not do.
+function researched(t) {
+  const w = initialized(t);
+  assert.equal(dr(mergeArgs(w, writeJson(path.join(w.work, 'fragment.json'), fragment()))).status, 0);
+  assert.equal(dr(['mark-checked', w.dir]).status, 0);
+  return w;
+}
+// What Claude writes when the research is done: every key the command takes. Two sources back the first finding, and the second
+// says that one is all it has.
+const synthesis = extra => ({
+  summary: {
+    findings: [
+      { text: 'ข้อค้นพบแรก สองแหล่งยืนยัน', cites: ['s1', 's2'] },
+      { text: 'ข้อค้นพบที่สอง มีแหล่งเดียว', cites: ['s1'], singleSource: true },
+    ],
+    startTomorrow: ['เริ่มอย่างแรก', 'เริ่มอย่างที่สอง', 'เริ่มอย่างที่สาม'],
+  },
+  readingPath: ['g-know-1', 'g-know-1-2', 'g-know-1-1'],
+  forYou: { 'g-know-1': 'สำหรับคุณ: เริ่มจากภาพรวม', 'g-know-1-2': 'สำหรับคุณ: ข้อนี้ตรงกับเป้าหมาย' },
+  rootSummary: 'สรุปทั้งแผนที่ในสองประโยค',
+  ...extra,
+});
+const synthesize = (w, data, options) => dr(['synthesize', w.dir, '--file', writeJson(path.join(w.work, 'synthesis.json'), data, options)]);
+const RESEARCHED_NODES = ['g-know-1', 'g-know-1-1', 'g-know-1-2'];
+
+test('synthesize sets the summary, the reading path, forYou and the root summary, and changes nothing else', t => {
+  const w = researched(t);
+  const before = readMap(w.dir);
+  const pageBefore = readPage(w.dir);
+  const data = synthesis();
+  const run = synthesize(w, data);
+  assert.equal(run.status, 0, run.stdout + run.stderr);
+  assert.deepEqual(run.json, { updated: ['summary', 'readingPath', 'forYou', 'rootSummary'] });
+
+  const after = readMap(w.dir);
+  assert.deepEqual(after.summary, data.summary);
+  assert.deepEqual(after.readingPath, data.readingPath);
+  assert.equal(after.root.summary, data.rootSummary);
+  assert.equal(findNode(after, 'g-know-1').forYou, data.forYou['g-know-1']);
+  assert.equal(findNode(after, 'g-know-1-2').forYou, data.forYou['g-know-1-2']);
+  assert.equal('forYou' in findNode(after, 'g-know-1-1'), false, 'a node that is not named gets none');
+
+  // The map is the old one with those fields set and updatedAt stamped: no other node and no other field moved.
+  const expected = structuredClone(before);
+  Object.assign(expected, { summary: data.summary, readingPath: data.readingPath, updatedAt: after.updatedAt });
+  expected.root.summary = data.rootSummary;
+  for (const [id, text] of Object.entries(data.forYou)) findNode(expected, id).forYou = text;
+  assert.deepEqual(after, expected);
+  // The two fields a merge with a `self` would have moved on the nodes it names, said out loud.
+  assert.deepEqual(RESEARCHED_NODES.map(id => findNode(after, id).status), ['done', 'frontier', 'frontier']);
+  assert.deepEqual(
+    RESEARCHED_NODES.map(id => findNode(after, id).researchedAt),
+    RESEARCHED_NODES.map(id => findNode(before, id).researchedAt),
+  );
+  assert.ok(findNode(before, 'g-know-1').researchedAt, 'there was a time to keep');
+  assert.deepEqual(validateMap(after), { ok: true, errors: [] });
+
+  // The page was written again, from the saved map.
+  const page = readPage(w.dir);
+  assert.notEqual(page, pageBefore);
+  assert.ok(page.includes(data.rootSummary) && page.includes(data.summary.findings[0].text) && page.includes(after.updatedAt));
+  assert.deepEqual(listing(w.dir), TOPIC_FILES);
+});
+
+test('synthesize applies only the keys it is given, lists them in a fixed order, and replaces a key as a whole', t => {
+  const w = researched(t);
+  assert.equal(synthesize(w, synthesis()).status, 0);
+  const full = readMap(w.dir);
+
+  // Two keys, written in the other order. The others stay, and what is given replaces what was there.
+  const some = synthesize(w, { rootSummary: 'สรุปใหม่', readingPath: ['g-know-1'] });
+  assert.deepEqual(some.json, { updated: ['readingPath', 'rootSummary'] });
+  let map = readMap(w.dir);
+  assert.deepEqual(map.readingPath, ['g-know-1'], 'the old path was replaced, not added to');
+  assert.equal(map.root.summary, 'สรุปใหม่');
+  assert.deepEqual(map.summary, full.summary);
+  assert.equal(findNode(map, 'g-know-1-2').forYou, findNode(full, 'g-know-1-2').forYou);
+
+  // A summary replaces the old one as a whole: no finding of the old one is left.
+  const summary = { findings: [], startTomorrow: ['เริ่มพรุ่งนี้'] };
+  assert.deepEqual(synthesize(w, { summary }).json, { updated: ['summary'] });
+  assert.deepEqual(readMap(w.dir).summary, summary);
+
+  // forYou sets the nodes it names, in place of what they had, and leaves the others' text.
+  assert.deepEqual(synthesize(w, { forYou: { 'g-know-1-1': 'ใหม่', 'g-know-1': 'แก้แล้ว' } }).json, { updated: ['forYou'] });
+  map = readMap(w.dir);
+  assert.deepEqual(
+    RESEARCHED_NODES.map(id => findNode(map, id).forYou),
+    ['แก้แล้ว', 'ใหม่', synthesis().forYou['g-know-1-2']],
+  );
+
+  // A forYou that names no node names nothing and changes nothing, though it is still listed as applied.
+  assert.deepEqual(synthesize(w, { forYou: {} }).json, { updated: ['forYou'] });
+  const after = readMap(w.dir);
+  assert.deepEqual(after, { ...map, updatedAt: after.updatedAt });
+});
+
+test('synthesize refuses a file it cannot apply, with one error line, and leaves map.json and index.html byte-identical', t => {
+  const w = researched(t);
+  const [mapBefore, pageBefore] = [bytesOf(w.dir, 'map.json'), bytesOf(w.dir, 'index.html')];
+  const cases = [
+    ['a list', ['summary'], /^the synthesis file must hold a JSON object$/],
+    ['a string', 'summary', /^the synthesis file must hold a JSON object$/],
+    ['null', null, /^the synthesis file must hold a JSON object$/],
+    ['an empty object', {}, /^the synthesis file is empty: give at least one of summary, readingPath, forYou, rootSummary$/],
+    ['an unknown key', synthesis({ findings: [] }), /^unknown key "findings" in the synthesis file \(use summary, readingPath, forYou, rootSummary\)$/],
+    ['two unknown keys', { a: 1, rootSummary: 'x', b: 2 }, /^unknown keys "a", "b" in the synthesis file/],
+    ['unknown nodes in forYou', synthesis({ forYou: { 'g-know-1': 'ok', nope: 'x', alsoNope: 'y' } }), /^forYou: unknown node "nope", unknown node "alsoNope"$/],
+    ['a forYou that is no object', synthesis({ forYou: ['g-know-1'] }), /^forYou must be an object of node id to text$/],
+    ['a forYou text that is no text', synthesis({ forYou: { 'g-know-1': 5 } }), /^forYou "g-know-1" must be non-empty text$/],
+    ['a forYou text that is blank', synthesis({ forYou: { 'g-know-1': ' \n ' } }), /^forYou "g-know-1" must be non-empty text$/],
+    ['a root summary that is no text', synthesis({ rootSummary: ['x'] }), /^rootSummary must be non-empty text$/],
+    ['a root summary that is blank', synthesis({ rootSummary: '   ' }), /^rootSummary must be non-empty text$/],
+  ];
+  for (const [what, data, message] of cases) {
+    const run = synthesize(w, data);
+    assert.equal(run.status, 1, `${what} was accepted: ${run.stdout}`);
+    assert.deepEqual(Object.keys(run.json), ['error'], what);
+    assert.match(run.json.error, message, what);
+    assert.equal(run.stderr, '', what);
+    assert.ok(bytesOf(w.dir, 'map.json').equals(mapBefore), `${what}: map.json changed`);
+    assert.ok(bytesOf(w.dir, 'index.html').equals(pageBefore), `${what}: index.html changed`);
+  }
+  assert.deepEqual(listing(w.dir), TOPIC_FILES, 'the lock was released and no temp file is left');
+});
+
+test('synthesize runs the validator on the result: what it finds is listed in errors, and nothing is saved', t => {
+  const w = researched(t);
+  const [mapBefore, pageBefore] = [bytesOf(w.dir, 'map.json'), bytesOf(w.dir, 'index.html')];
+  const finding = cites => ({ text: 'ข้อค้นพบ', cites });
+  const cases = [
+    [{ readingPath: ['g-know-1', 'zzz'] }, 'readingPath[1]: unknown node "zzz"'],
+    [{ readingPath: 'g-know-1' }, 'readingPath: must be an array'],
+    [{ summary: 'text' }, 'summary: must be an object with findings and startTomorrow'],
+    [{ summary: { findings: [] } }, 'summary.startTomorrow: must be an array'],
+    [{ summary: { findings: [finding(['s1'])], startTomorrow: [] } }, 'summary.findings[0]: finding needs 2 sources or singleSource'],
+    [{ summary: { findings: [finding(['s9', 's1'])], startTomorrow: [] } }, 'summary.findings[0].cites[0]: unknown source "s9"'],
+    [{ summary: { findings: Array.from({ length: 6 }, () => finding(['s1', 's2'])), startTomorrow: [] } }, 'summary.findings: at most 5 items (got 6)'],
+    [{ summary: { findings: [], startTomorrow: ['a', 'b', 'c', 'd'] } }, 'summary.startTomorrow: at most 3 items (got 4)'],
+  ];
+  for (const [data, expected] of cases) {
+    const run = synthesize(w, data);
+    assert.equal(run.status, 1, `${expected}: ${run.stdout}`);
+    assert.match(run.json.error, /does not validate.*nothing was saved/);
+    assert.deepEqual(run.json.errors, [expected]);
+    assert.equal(run.stderr, '');
+    assert.ok(bytesOf(w.dir, 'map.json').equals(mapBefore), `${expected}: map.json changed`);
+    assert.ok(bytesOf(w.dir, 'index.html').equals(pageBefore), `${expected}: index.html changed`);
+  }
+  assert.deepEqual(listing(w.dir), TOPIC_FILES);
+});
+
+test('synthesize reads a file that starts with a UTF-8 BOM, and reports a file it cannot read', t => {
+  const w = researched(t);
+  const bom = synthesize(w, { rootSummary: 'สรุปจากไฟล์ที่มี BOM' }, { bom: true });
+  assert.equal(bom.status, 0, bom.stdout + bom.stderr);
+  assert.equal(readMap(w.dir).root.summary, 'สรุปจากไฟล์ที่มี BOM');
+
+  const mapBefore = bytesOf(w.dir, 'map.json');
+  const absent = dr(['synthesize', w.dir, '--file', path.join(w.work, 'absent.json')]);
+  assert.equal(absent.status, 1);
+  assert.match(absent.json.error, /cannot read synthesis file .*ENOENT/);
+  const broken = dr(['synthesize', w.dir, '--file', writeBytes(path.join(w.work, 'broken.json'), '{"summary": ')]);
+  assert.equal(broken.status, 1);
+  assert.match(broken.json.error, /synthesis file .* is not valid JSON/);
+  for (const run of [absent, broken]) assert.equal(run.stderr, '');
+  assert.ok(bytesOf(w.dir, 'map.json').equals(mapBefore));
 });
 
 // ---- check-urls ----
@@ -790,8 +967,65 @@ test('serve fails, with one error line, when none of the 11 ports is free', asyn
   const port = await findPorts(t, { held: 11 });
   const run = await drAsync(['serve', w.dir, '--port', String(port)]);
   assert.equal(run.status, 1);
-  assert.equal(run.json.error, `ports ${port}-${port + 10} are all in use`);
+  assert.equal(run.json.error, `ports ${port}-${port + 10} are all in use or reserved by the system`);
   assert.equal(run.stderr, '');
+});
+
+// Windows answers EACCES, not EADDRINUSE, for a port in an excluded range (Hyper-V keeps such ranges), and a test cannot make it do
+// so: an excluded range is a system setting, and this machine's only one (50000-50059, put there by an administrator) can still be
+// bound. So these tests give the child a stub to preload (node --require). It makes net.Server#listen fail on the ports named in
+// DR_TEST_REFUSE, a JSON object of port to error code, the way Node itself fails: asynchronously, with an error that has the code. The
+// rest, dr.cjs, startServer and every real socket, runs as it does for real. The function is the stub's source and runs in the child.
+function refusePorts() {
+  const net = require('node:net');
+  const refused = JSON.parse(process.env.DR_TEST_REFUSE);
+  const listen = net.Server.prototype.listen;
+  net.Server.prototype.listen = function refusingListen(...args) {
+    const code = refused[args[0]];
+    if (code === undefined) return listen.apply(this, args);
+    const address = '127.0.0.1';
+    const err = Object.assign(new Error(`listen ${code} ${address}:${args[0]}`), { code, syscall: 'listen', address, port: args[0] });
+    process.nextTick(() => this.emit('error', err));
+    return this;
+  };
+}
+// The options that give a child the stub: `refuse` maps a port to the code listening on it fails with.
+function refusing(w, refuse) {
+  const stub = writeBytes(path.join(w.work, 'refuse-ports.cjs'), `(${refusePorts})();`);
+  return { nodeArgs: ['--require', stub], env: { DR_TEST_REFUSE: JSON.stringify(refuse) } };
+}
+
+test('serve moves on past a port the system keeps for itself (EACCES) as well as past one that is in use', async t => {
+  const w = initialized(t);
+  const port = await findPorts(t, { held: 1, free: 3 }); // port is in use for real, and the next 3 are free
+  const run = spawnDr(t, ['serve', w.dir, '--port', String(port), '--idle-minutes', '0.05'], refusing(w, { [port + 1]: 'EACCES' }));
+  const started = await run.next(isStarted, 'server-started');
+  assert.ok(portOf(started.url) > port + 1 && portOf(started.url) <= port + 10, `${started.url} is not past ${port} and ${port + 1}`);
+  assert.equal((await fetch(`${started.url}/map.json`)).status, 200, 'it serves on the port it printed');
+  assert.equal(run.stderr, '');
+});
+
+test('serve fails, with one error line, when every one of the 11 ports is in use or reserved', async t => {
+  const w = initialized(t);
+  const port = await findPorts(t, { held: 6 }); // the first 6 are in use for real, the other 5 are refused with EACCES
+  const refuse = Object.fromEntries([6, 7, 8, 9, 10].map(n => [port + n, 'EACCES']));
+  const run = await drAsync(['serve', w.dir, '--port', String(port)], refusing(w, refuse));
+  assert.equal(run.status, 1);
+  assert.equal(run.json.error, `ports ${port}-${port + 10} are all in use or reserved by the system`);
+  assert.equal(run.stderr, '');
+});
+
+test('serve moves on for EADDRINUSE and EACCES only: any other error of the system is the failure', async t => {
+  const w = initialized(t);
+  const port = await findPorts(t, { held: 0, free: 2 }); // both free, so only the refusal can stop the first
+  const run = spawnDr(t, ['serve', w.dir, '--port', String(port)], refusing(w, { [port]: 'EMFILE' }));
+  // The first thing it prints is the answer. A serve that went on to the next port would print server-started and then keep running,
+  // so this does not wait for it to end.
+  await waitFor(() => run.lines.length > 0 || run.exited, 'its first line');
+  assert.match(run.lines[0].error ?? JSON.stringify(run.lines[0]), /EMFILE/, 'the first line is the error of the system');
+  assert.deepEqual(await run.exit, { code: 1, signal: null });
+  assert.equal(run.lines.length, 1, 'it did not go on to the next port');
+  assert.match(run.stderr, /EMFILE/, 'a failure that is no refusal keeps its stack');
 });
 
 test('serve with no --port starts on one of the ports 7357 to 7367', async t => {
@@ -898,6 +1132,7 @@ test('the commands that write a topic take the lock, and the others do not', asy
   dr(['enqueue', w.dir, '--queue', 'g-know-1:detail']);
   const [queued] = dr(['accept', w.dir]).json.accepted;
   const file = writeJson(path.join(w.work, 'fragment.json'), fragment());
+  const synthesisFile = writeJson(path.join(w.work, 'synthesis.json'), { rootSummary: 'สรุป' });
   const lock = inFolder(w.dir, 'map.json.lock');
   fs.writeFileSync(lock, 'held\n');
 
@@ -909,6 +1144,7 @@ test('the commands that write a topic take the lock, and the others do not', asy
     init: initArgs(w, ['--force']),
     render: ['render', w.dir],
     merge: mergeArgs(w, file),
+    synthesize: ['synthesize', w.dir, '--file', synthesisFile],
     'mark-checked': ['mark-checked', w.dir],
     accept: ['accept', w.dir],
     start: ['start', w.dir, queued.id],
@@ -989,6 +1225,8 @@ test('every failure is one {"error"} line on stdout and exit 1, with no stack tr
     [['init', '--brief', 'b.json'], /^--slug is required/],
     [['merge', nowhere, '--parent', 'g-know-1'], /^--fragment is required/],
     [['enqueue', nowhere], /^--queue is required/],
+    [['synthesize', nowhere], /^--file is required \(usage: synthesize <dir> --file <synthesis\.json>\)$/],
+    [['synthesize', '--file', 'x'], /^missing <dir> \(usage: synthesize /],
     [['serve', nowhere, '--port', 'abc'], /^--port must be a whole number/],
     [['serve', nowhere, '--port', '-1'], /^--port must be a whole number/],
     [['watch', nowhere, '--idle-minutes', '0'], /^--idle-minutes must be a number above 0/],
