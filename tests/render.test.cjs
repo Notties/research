@@ -5,6 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 const vm = require('node:vm');
 const S = require('../assets/shared.js');
+const C = require('../assets/viewer-core.js');
 const { createMap } = require('../scripts/lib/map.cjs');
 const { renderIndexHtml, writeIndexHtml } = require('../scripts/lib/render.cjs');
 
@@ -130,6 +131,9 @@ class FakeElement {
     const at = this.childNodes.indexOf(node);
     if (at !== -1) this.childNodes.splice(at, 1);
     node.parentNode = null;
+    // As in the browser, an element that leaves the page, or moves within it, takes the focus with it.
+    const doc = this.ownerDocument;
+    if (node.nodeType === 1 && doc.activeElement && node.contains(doc.activeElement)) doc.activeElement = doc.body;
     return node;
   }
   remove() { this.parentNode?.removeChild(this); }
@@ -169,7 +173,9 @@ class FakeElement {
   removeEventListener(type, listener) { this.listeners = this.listeners.filter(l => l.type !== type || l.listener !== listener); }
   getBoundingClientRect() { return { x: 0, y: 0, left: 0, top: 0, width: 1000, height: 600, right: 1000, bottom: 600 }; }
   getComputedTextLength() { return this.textContent.length * 7; }
-  focus() {}
+  focus() { this.ownerDocument.activeElement = this; }
+  setSelectionRange(start, end, direction = 'none') { Object.assign(this, { selectionStart: start, selectionEnd: end, selectionDirection: direction }); }
+  select() { this.setSelectionRange(0, String(this.value ?? '').length); }
   scrollIntoView() {}
   get innerHTML() { return noHtml(); }
   set innerHTML(_) { noHtml(); }
@@ -196,6 +202,7 @@ function fakeDocument(html, readyState) {
   };
   document.documentElement = new FakeElement(document, NS_HTML, 'html');
   document.body = document.documentElement.appendChild(new FakeElement(document, NS_HTML, 'body'));
+  document.activeElement = document.body;
   const attributesOf = text => [...text.matchAll(/([^\s=/]+)(?:="([^"]*)")?/g)].map(m => [m[1], m[2] ?? '']);
   for (const [name, value] of attributesOf(/<html([^>]*)>/.exec(html)[1])) document.documentElement.setAttribute(name, value);
   const markup = html.replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1>/gi, ''); // what is left is the page's elements
@@ -255,6 +262,70 @@ const settle = () => new Promise(resolve => setImmediate(resolve));
 const noTimers = { setTimeout: () => 0, clearTimeout() {}, setInterval: () => 0, clearInterval() {} };
 
 const readDemo = () => JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'demo-map.json'), 'utf8'));
+const findIn = (node, id) => (node.id === id ? node : (node.children ?? []).map(child => findIn(child, id)).find(Boolean));
+const DOT = String.fromCharCode(0xb7);
+
+// The live page against a stand-in server. live.served is what GET /map.json returns; live.reply is what POST /expand
+// answers: { status, body }, 'down' (a network error) or 'hang' (no answer until the request is aborted). Timers are kept
+// and never fire on their own (D3's included); runTimers(ms) fires the ones set for ms. console.error is recorded.
+function startLive(map, { store = fakeStorage() } = {}) {
+  const live = { served: map, reply: { status: 202, body: { id: 'r-test-1' } }, posts: [], mapFetches: 0, streams: [], errors: [] };
+  const fetch = async (url, options = {}) => {
+    if (url === '/map.json') {
+      live.mapFetches += 1;
+      return { ok: true, status: 200, json: async () => structuredClone(live.served) };
+    }
+    live.posts.push(JSON.parse(options.body));
+    const reply = live.reply;
+    if (reply === 'down') throw new TypeError('Failed to fetch');
+    if (reply === 'hang') {
+      return new Promise((_, reject) => {
+        options.signal?.addEventListener('abort', () => reject(new DOMException('The operation was aborted.', 'AbortError')));
+      });
+    }
+    return { ok: reply.status < 300, status: reply.status, json: async () => reply.body };
+  };
+  class EventSource {
+    constructor(url) {
+      this.url = url;
+      this.listeners = [];
+      live.streams.push(this);
+    }
+    addEventListener(type, listener) { this.listeners.push({ type, listener }); }
+    emit(type, data) { for (const l of this.listeners) if (l.type === type) l.listener({ type, data }); }
+  }
+  const timers = [];
+  const globals = {
+    fetch, EventSource, AbortController,
+    console: { error: (...args) => live.errors.push(args) },
+    setTimeout: (fn, ms) => timers.push({ fn, ms, cleared: false }), // the id is the timer's place in the list, from 1
+    clearTimeout: id => { if (timers[id - 1]) timers[id - 1].cleared = true; },
+    setInterval: () => 0,
+    clearInterval() {},
+  };
+  const page = runPage(renderIndexHtml(map, { live: true }), { readyState: 'interactive', localStorage: { value: store }, globals });
+  const menu = page.byId('dr-canvas').querySelector('div.dr-menu'); // the one menu element, wherever it is shown
+  return {
+    ...page,
+    live,
+    store,
+    menu,
+    stream: () => live.streams[0],
+    runTimers(ms) {
+      for (const timer of timers) {
+        if (timer.ms !== ms || timer.cleared) continue;
+        timer.cleared = true;
+        timer.fn();
+      }
+    },
+    busy: id => nodeEl(page.document, id).classList.contains('loading'),
+    // Clicks a node, then the direction with this label in the menu that opens.
+    choose(id, label) {
+      fire(nodeEl(page.document, id), 'click');
+      fire(menu.querySelectorAll('button[data-dir]').find(b => b.textContent === label), 'click');
+    },
+  };
+}
 
 // ---- the plan's tests ----
 
@@ -445,57 +516,48 @@ test('file mode: a direction is queued once in this browser, and a question only
 
 test('live mode: an accepted request looks busy at once and until map.queue holds it; one the server cannot take stays in this browser', async () => {
   const demo = readDemo();
-  const store = fakeStorage();
-  const posts = [];
-  let reply = { status: 202, body: { id: 'r-test-1' } }; // 'down': the server is gone
-  let served = demo;
-  const fetch = async (url, options = {}) => {
-    if (url === '/map.json') return { ok: true, status: 200, json: async () => structuredClone(served) };
-    posts.push(JSON.parse(options.body));
-    if (reply === 'down') throw new TypeError('Failed to fetch');
-    return { ok: reply.status < 300, status: reply.status, json: async () => reply.body };
-  };
-  const streams = [];
-  class EventSource {
-    constructor(url) {
-      this.url = url;
-      this.listeners = [];
-      streams.push(this);
-    }
-    addEventListener(type, listener) { this.listeners.push({ type, listener }); }
-    emit(type, data) { for (const l of this.listeners) if (l.type === type) l.listener({ type, data }); }
-  }
-  const { document, byId } = runPage(renderIndexHtml(demo, { live: true }), {
-    readyState: 'interactive', localStorage: { value: store }, globals: { fetch, EventSource, ...noTimers },
-  });
-  const dot = String.fromCharCode(0xb7);
-  const busy = id => nodeEl(document, id).classList.contains('loading');
-  const choose = (id, label) => {
-    fire(nodeEl(document, id), 'click');
-    fire(byId('dr-canvas').querySelector('div.dr-menu').querySelectorAll('button[data-dir]').find(b => b.textContent === label), 'click');
-  };
-  assert.deepEqual(streams.map(s => s.url), ['/events']);
+  const { document, byId, live, store, menu, stream, busy, choose } = startLive(demo);
+  const status = () => byId('dr-status').textContent;
+  assert.deepEqual(live.streams.map(s => s.url), ['/events']);
 
   fire(nodeEl(document, 'g-do-2'), 'click');
   choose('g-do-2-1', 'ลงรายละเอียด');
   await settle();
-  assert.deepEqual(posts, [{ nodeId: 'g-do-2-1', direction: 'detail' }]);
+  assert.deepEqual(live.posts, [{ nodeId: 'g-do-2-1', direction: 'detail' }]);
   assert.equal(busy('g-do-2-1'), true); // at once: map.json does not hold the request yet
-  assert.equal(byId('dr-status').textContent, `กำลังขุด 1 ${dot} รอคิว 2`);
+  assert.equal(status(), `กำลังขุด 1 ${DOT} รอคิว 2`);
 
-  // map.queue catches up with the request: still busy, and counted once.
-  served = structuredClone(demo);
-  served.queue.push({ id: 'r-test-1', nodeId: 'g-do-2-1', direction: 'detail', at: '2026-11-01T11:00:00.000Z', status: 'pending' });
-  streams[0].emit('map', '{"updatedAt":"2026-11-01T11:00:01.000Z"}');
+  // map.queue catches up with the request: still busy, counted once, and the reader's selection stays.
+  live.served = structuredClone(demo);
+  live.served.queue.push({ id: 'r-test-1', nodeId: 'g-do-2-1', direction: 'detail', at: '2026-11-01T11:00:00.000Z', status: 'pending' });
+  stream().emit('map', '{"updatedAt":"2026-11-01T11:00:01.000Z"}');
   await settle();
   assert.equal(busy('g-do-2-1'), true);
-  assert.equal(byId('dr-status').textContent, `กำลังขุด 1 ${dot} รอคิว 2`);
+  assert.equal(status(), `กำลังขุด 1 ${DOT} รอคิว 2`);
+  assert.ok(nodeEl(document, 'g-do-2-1').classList.contains('sel'));
+  assert.equal(byId('dr-panel').querySelector('h3').textContent, 'Three.js');
 
-  // A 5xx, then no server at all: each request stays in this browser's queue, and the chip offers the command.
-  reply = { status: 503, body: { error: 'unavailable' } };
+  // The item leaves map.queue once it is done: the node is no longer busy, though nothing else about it changed.
+  live.served = structuredClone(demo);
+  stream().emit('map', '{"updatedAt":"2026-11-01T11:05:00.000Z"}');
+  await settle();
+  assert.equal(busy('g-do-2-1'), false);
+  assert.equal(status(), `กำลังขุด 1 ${DOT} รอคิว 1`);
+
+  // A 400: the menu says why, and nothing goes to this browser's queue.
+  live.reply = { status: 400, body: { error: 'unknown node "g-do-2-3"' } };
   choose('g-do-2-3', 'เทียบทางเลือก');
   await settle();
-  reply = 'down';
+  assert.equal(menu.hidden, false);
+  assert.equal(menu.querySelector('p.dr-menu-msg').textContent, 'ส่งคำขอไม่ได้: unknown node "g-do-2-3"');
+  assert.equal(store.getItem('dr-queue:awwwards-3d-web'), null);
+  assert.equal(busy('g-do-2-3'), false);
+
+  // A 5xx, then no server at all: each request stays in this browser's queue, and the chip offers the command.
+  live.reply = { status: 503, body: { error: 'unavailable' } };
+  choose('g-do-2-3', 'เทียบทางเลือก');
+  await settle();
+  live.reply = 'down';
   choose('g-do-2-2', 'ลงรายละเอียด');
   await settle();
   assert.deepEqual(JSON.parse(store.getItem('dr-queue:awwwards-3d-web')), [
@@ -508,8 +570,191 @@ test('live mode: an accepted request looks busy at once and until map.queue hold
 
   // A broken event stream shows the offline mark.
   assert.equal(byId('dr-offline').hidden, true);
-  streams[0].emit('error');
+  stream().emit('error');
   assert.equal(byId('dr-offline').hidden, false);
+});
+
+test('live mode: an accepted request stops looking busy once its node is researched after the POST, though map.queue never showed it', async () => {
+  const demo = readDemo();
+  const { document, live, stream, busy, choose } = startLive(demo);
+  fire(nodeEl(document, 'g-do-2'), 'click');
+  live.reply = { status: 202, body: { id: 'r-a' } };
+  choose('g-do-2-1', 'ลงรายละเอียด');
+  await settle();
+  live.reply = { status: 200, body: { id: 'r-b', duplicate: true } };
+  choose('g-do-2-2', 'หาตัวอย่างจริง');
+  await settle();
+  assert.deepEqual([busy('g-do-2-1'), busy('g-do-2-2')], [true, true]);
+  const later = new Date(Date.now() + 60000).toISOString(); // after both POSTs
+  live.served = structuredClone(demo);
+  findIn(live.served.root, 'g-do-2-1').researchedAt = later;
+  findIn(live.served.root, 'g-do-2-2').expansions = [{ direction: 'examples', at: later }];
+  stream().emit('map', '{}');
+  await settle();
+  assert.deepEqual([busy('g-do-2-1'), busy('g-do-2-2')], [false, false]);
+});
+
+test('live mode: the page fetches map.json each time its event stream opens, so a change made before it listened is not missed', async () => {
+  const { live, stream } = startLive(readDemo());
+  assert.equal(live.mapFetches, 0);
+  stream().emit('open');
+  await settle();
+  assert.equal(live.mapFetches, 1);
+  stream().emit('error');
+  stream().emit('open'); // reconnected
+  await settle();
+  assert.equal(live.mapFetches, 2);
+});
+
+test('live mode: a map that cannot be drawn leaves the last good map in place, and its error in the console', async () => {
+  const demo = readDemo();
+  const { document, byId, live, stream } = startLive(demo);
+  fire(nodeEl(document, 'g-do-2'), 'click'); // selected and opened
+  const before = drawn(document, 'g.km-node').length;
+  const bad = structuredClone(demo);
+  bad.queue = {}; // JSON that parses, but a queue that is not a list: drawing this map throws
+  findIn(bad.root, 'g-do-2').children.push({ id: 'g-do-2-4', level: 'item', title: 'Vite', status: 'planned', children: [] });
+  live.served = bad;
+  stream().emit('map', '{}');
+  await settle();
+  assert.equal(drawn(document, 'g.km-node').length, before);
+  assert.ok(!nodeEl(document, 'g-do-2-4'), 'the node of the bad map is gone');
+  assert.ok(nodeEl(document, 'g-do-2').classList.contains('sel'));
+  assert.equal(byId('dr-panel').querySelector('h3').textContent, 'สิ่งที่ต้องมี');
+  assert.equal(byId('dr-status').textContent, `กำลังขุด 1 ${DOT} รอคิว 1`);
+  assert.equal(live.errors.length, 1);
+  assert.ok(live.errors[0].some(arg => arg?.name === 'TypeError'), 'the error itself is logged');
+
+  // The page goes on working: the next good map is taken in.
+  live.served = structuredClone(bad);
+  live.served.queue = demo.queue;
+  stream().emit('map', '{}');
+  await settle();
+  assert.equal(drawn(document, 'g.km-node').length, before + 1);
+  assert.equal(live.errors.length, 1);
+});
+
+test('live mode: a map event that redraws the panel keeps the question box focused, with its text and selection', async () => {
+  const { document, byId, live, menu, stream } = startLive(readDemo());
+  fire(nodeEl(document, 'g-do-2'), 'click');
+  fire(nodeEl(document, 'g-do-2-1'), 'click'); // a leaf: selected, menu beside it
+  fire(byId('dr-panel').querySelectorAll('button[data-act]').find(b => b.getAttribute('data-act') === 'dig'), 'click');
+  assert.ok(byId('dr-panel').contains(menu)); // "ขุดต่อ" puts the menu in the panel
+  fire(menu.querySelectorAll('button[data-dir]').find(b => b.getAttribute('data-dir') === 'question'), 'click');
+  const input = menu.querySelector('form').querySelector('input');
+  // Elements are compared by identity with assert.ok: a failing assert.equal would print two stand-in elements, which
+  // reach the whole page, and that takes for ever.
+  assert.ok(document.activeElement === input, 'the question box has the focus');
+  input.value = 'ทำไมมือถือช้า';
+  input.setSelectionRange(3, 7, 'backward');
+  live.served = structuredClone(live.served);
+  stream().emit('map', '{}'); // the panel is drawn again
+  await settle();
+  assert.ok(byId('dr-panel').contains(menu));
+  assert.ok(document.activeElement === input, 'the question box has the focus again');
+  assert.deepEqual([input.value, input.selectionStart, input.selectionEnd, input.selectionDirection], ['ทำไมมือถือช้า', 3, 7, 'backward']);
+});
+
+test('live mode: a POST with no answer gives up after 5 s and keeps the request here; meanwhile no menu takes a direction', async () => {
+  const { document, byId, live, store, menu, runTimers, choose } = startLive(readDemo());
+  const directions = () => menu.querySelectorAll('button[data-dir]');
+  live.reply = 'hang';
+  fire(nodeEl(document, 'g-do-2'), 'click');
+  choose('g-do-2-1', 'ลงรายละเอียด');
+  await settle();
+  assert.ok(directions().every(b => b.disabled));
+  fire(nodeEl(document, 'g-do-2-2'), 'click'); // another leaf's menu, opened while the POST waits
+  assert.equal(menu.hidden, false);
+  assert.ok(directions().every(b => b.disabled));
+  fire(directions()[0], 'click');
+  assert.equal(live.posts.length, 1); // that click was not taken
+  runTimers(5000); // no answer within 5 s: the request is aborted and kept in this browser
+  await settle();
+  assert.deepEqual(JSON.parse(store.getItem('dr-queue:awwwards-3d-web')), [{ nodeId: 'g-do-2-1', direction: 'detail' }]);
+  assert.equal(byId('dr-queue-chip').textContent, 'คิวรอขุด 1');
+  assert.ok(directions().every(b => !b.disabled)); // the menu that is open works again
+});
+
+test('file mode: queued items the copied command could not carry are dropped, so the command always parses', async () => {
+  const store = fakeStorage();
+  const good = { nodeId: 'g-do-2-1', direction: 'examples' };
+  store.setItem('dr-queue:awwwards-3d-web', JSON.stringify([
+    good,
+    { nodeId: 'g-do-2-1', direction: 'dance' }, // an unknown direction
+    { nodeId: 'g-do-2-1', direction: 'question', question: ' \n ' }, // a question that cleans to nothing
+    { nodeId: 'g-do-2-1', direction: 'question' },
+    { nodeId: '', direction: 'detail' },
+    { nodeId: 'a;b', direction: 'detail' }, // ";" and ":" would cut the --queue text in the wrong places
+    { nodeId: 'a:detail', direction: 'examples' },
+    { nodeId: 7, direction: 'detail' },
+    'junk',
+    null,
+  ]));
+  const copied = [];
+  const clipboard = { writeText: async text => { copied.push(text); } }; // a stand-in: nothing reaches a real clipboard
+  const { byId } = runPage(renderIndexHtml(readDemo()), {
+    readyState: 'interactive', localStorage: { value: store }, globals: { ...noTimers, navigator: { clipboard } },
+  });
+  assert.equal(byId('dr-queue-chip').textContent, 'คิวรอขุด 1');
+  fire(byId('dr-queue-chip'), 'click');
+  fire(byId('dr-queue').querySelectorAll('button[data-q]').find(b => b.getAttribute('data-q') === 'copy'), 'click');
+  await settle();
+  assert.deepEqual(copied, [C.buildQueueCommand('awwwards-3d-web', [good])]);
+  assert.deepEqual(C.parseQueue(/--queue "(.*)"$/.exec(copied[0])[1]), [good]);
+});
+
+test('a status, confidence, point type or source type named like an Object.prototype member shows nothing from it', () => {
+  const m = newMap();
+  const group = m.root.children[0].children[0]; // a group, which a new map draws
+  Object.assign(group, {
+    status: 'constructor', confidence: 'constructor', confidenceReason: 'r',
+    points: [{ text: 'p', type: 'constructor', cites: ['s1'] }],
+  });
+  m.sources = { s1: { id: 's1', title: 'T', url: 'https://example.com/', publisher: 'P', type: 'constructor', accessedAt: '2026-11-01' } };
+  m.summary.findings = [{ text: 'f', cites: ['s1'], singleSource: true }];
+  const { document, byId } = runPage(renderIndexHtml(m), { readyState: 'interactive', globals: noTimers });
+  const shown = () => byId('dr-panel').textContent;
+  assert.doesNotMatch(shown(), /function|native code/); // the root panel lists s1
+  fire(nodeEl(document, group.id), 'click');
+  assert.ok(shown().includes('p'));
+  assert.doesNotMatch(shown(), /function|native code/);
+  assert.ok(!shown().includes('ความมั่นใจ')); // an unknown confidence has no section
+});
+
+// ---- the source-age tag (spec section 8, rule 4) ----
+
+// The source rows of the panel, by source id, each with the texts of its tags.
+const sourceTags = byId => Object.fromEntries(byId('dr-panel').querySelectorAll('div[id]')
+  .filter(row => row.id.startsWith('src-'))
+  .map(row => [row.id.slice(4), row.querySelectorAll('span.kp-tag').map(tag => tag.textContent)]));
+
+test('a source published more than two calendar years before it was read is tagged "เก่ากว่า 2 ปี" (the demo)', () => {
+  const { document, byId } = runPage(renderIndexHtml(readDemo()), { readyState: 'interactive', globals: noTimers });
+  const old = ['เก่ากว่า 2 ปี'];
+  // The root panel lists the sources of the findings: s3 (2020) is old; s8 (2025) is not; the rest have no date.
+  assert.deepEqual(sourceTags(byId), { s4: [], s7: [], s1: [], s2: [], s3: old, s8: [], s6: [], s5: [] });
+  fire(nodeEl(document, 'g-know-3'), 'click');
+  fire(nodeEl(document, 'g-know-3-1'), 'click'); // cites s3 and s8
+  assert.deepEqual(sourceTags(byId), { s3: old, s8: [] });
+});
+
+test('the source-age tag: two years to the day is not older, a day more is, and a missing or unreadable date gives none', () => {
+  const m = newMap();
+  const source = (id, publishedAt, accessedAt = '2026-11-01') => ({
+    id, title: id, url: `https://example.com/${id}`, publisher: 'P', type: 'official', accessedAt, ...(publishedAt === undefined ? {} : { publishedAt }),
+  });
+  m.sources = {
+    exact: source('exact', '2024-11-01'),
+    dayMore: source('dayMore', '2024-10-31'),
+    timed: source('timed', '2024-10-31T23:59:00.000Z', '2026-11-01T00:00:00.000Z'),
+    none: source('none'),
+    badPublished: source('badPublished', 'soon'),
+    badAccessed: source('badAccessed', '2020-01-01', 'later'),
+  };
+  m.summary.findings = [{ text: 'f', cites: Object.keys(m.sources) }];
+  const { byId } = runPage(renderIndexHtml(m), { readyState: 'interactive', globals: noTimers });
+  const old = ['เก่ากว่า 2 ปี'];
+  assert.deepEqual(sourceTags(byId), { exact: [], dayMore: old, timed: old, none: [], badPublished: [], badAccessed: [] });
 });
 
 test('the shipped scripts hold no "<!--", which would let the browser swallow the closing tag', () => {

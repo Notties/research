@@ -312,6 +312,19 @@ test('queueKey: an absent, null and empty question are one key, and node, direct
   assert.notEqual(C.queueKey({ ...base, question: 'why' }), key);
 });
 
+test('cleanKey: requests that differ only in quotes, semicolons or spacing share a key; another node, direction or question does not', () => {
+  const asked = { nodeId: 'g-do-1', direction: 'question', question: 'ราคา "จริง" เท่าไร; ปี 2026' };
+  const key = C.cleanKey(asked);
+  assert.equal(key, C.queueKey({ ...asked, question: C.cleanQuestion(asked.question) })); // queueKey of the cleaned request
+  assert.equal(C.cleanKey({ ...asked, question: "  ราคา 'จริง'   เท่าไร,\n ปี 2026 " }), key);
+  assert.equal(C.cleanKey({ ...asked, id: 'r-1', status: 'pending', at: ISO }), key); // id, status and time are not part of it
+  assert.notEqual(C.cleanKey({ ...asked, nodeId: 'g-do-2' }), key);
+  assert.notEqual(C.cleanKey({ ...asked, direction: 'detail' }), key);
+  assert.notEqual(C.cleanKey({ ...asked, question: 'ราคาเท่าไร' }), key);
+  const plain = { nodeId: 'g-do-1', direction: 'detail' };
+  for (const question of [undefined, null, '', ' \n ']) assert.equal(C.cleanKey({ ...plain, question }), C.cleanKey(plain), String(question));
+});
+
 test('queueCounts counts queued items, and local items that are not already queued', () => {
   const map = { queue: [queued('q1', 'g-do-1', 'detail', 'researching'), queued('q2', 'g-warn-1', 'examples', 'pending')] };
   const duplicate = { nodeId: 'g-warn-1', direction: 'examples' };
@@ -761,9 +774,9 @@ test('safeStorage: setting undefined stores null, never the text "undefined"', (
 
 // ---- the file itself ----
 
-test('exports the 12 functions of the plan, queueKey and cleanQuestion, nothing else', () => {
+test('exports the 12 functions of the plan, queueKey, cleanQuestion and cleanKey, nothing else', () => {
   assert.deepEqual(Object.keys(C).sort(), [
-    'badgeFor', 'buildQueueCommand', 'cleanQuestion', 'formatQueue', 'isExpandable', 'numberCites', 'parseQueue',
+    'badgeFor', 'buildQueueCommand', 'cleanKey', 'cleanQuestion', 'formatQueue', 'isExpandable', 'numberCites', 'parseQueue',
     'pathTo', 'queueCounts', 'queueKey', 'readingNav', 'safeStorage', 'shortLabel', 'splitSides',
   ]);
   for (const [name, fn] of Object.entries(C)) assert.equal(typeof fn, 'function', name);

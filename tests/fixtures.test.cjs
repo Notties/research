@@ -58,7 +58,11 @@ test('demo fixture holds every case the viewer check needs', () => {
   const sources = Object.values(demo.sources);
   assert.equal(sources.length, 8);
   assert.deepEqual(new Set(sources.map(s => s.type)), new Set(S.SOURCE_TYPES)); // mixed: every type at least once
-  assert.ok(sources.some(s => s.publishedAt), 'a source with a publish date');
+  // For the source-age tag: one source published more than 2 years before it was read, one less, and some with no date.
+  const yearsOld = s => (Date.parse(s.accessedAt) - Date.parse(s.publishedAt)) / (365.25 * 24 * 3600 * 1000);
+  assert.ok(sources.some(s => s.publishedAt && yearsOld(s) > 2.1), 'a source older than 2 years');
+  assert.ok(sources.some(s => s.publishedAt && yearsOld(s) < 1.9), 'a source younger than 2 years');
+  assert.ok(sources.some(s => !s.publishedAt), 'a source with no publish date');
 
   assert.equal(demo.readingPath.length, 5);
   assert.equal(demo.summary.findings.length, 5);

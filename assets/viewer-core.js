@@ -108,7 +108,7 @@
    * the same question, and the id, the time and the status are not part of the key. This is the rule of queueKey in
    * scripts/lib/map.cjs, which the live server and the command-line tool dedupe by. The browser cannot require that file
    * (it reads files), so the rule is repeated here and a test keeps the two equal. queueCounts compares a cleaned form
-   * of it (countKey), so this function stays the same as the one in map.cjs.
+   * of it (cleanKey), so this function stays the same as the one in map.cjs.
    */
   const queueKey = r => JSON.stringify([r.nodeId, r.direction, r.question ?? '']);
 
@@ -126,10 +126,16 @@
     .replace(/;/g, ',')
     .trim();
 
-  // What queueCounts matches requests by: queueKey with the question cleaned. A request chosen offline reaches map.queue
-  // through the --queue text, so its question comes back cleaned, while one the live server queues may hold the question
-  // as it was typed. Cleaning both sides makes every copy of a request match the local one.
-  const countKey = item => queueKey({ ...item, question: cleanQuestion(item.question) });
+  /**
+   * The key that tells whether two requests ask for the same research: queueKey of the request with its question cleaned
+   * (cleanQuestion), so questions that differ only in quotes, semicolons or spacing are one question. A request chosen
+   * offline reaches map.queue through the --queue text, so its question comes back cleaned, while one the live server
+   * queues may hold the question as it was typed: cleaning both sides makes every copy of a request match. queueCounts
+   * and the viewer's offline queue dedupe by it, and so does the live server.
+   * @param {{ nodeId: string, direction: string, question?: string | null }} request
+   * @returns {string}
+   */
+  const cleanKey = request => queueKey({ ...request, question: cleanQuestion(request.question) });
 
   /**
    * The counts for the top bar. `researching` is the items of map.queue that are being researched. `pending` is the
@@ -142,8 +148,8 @@
    */
   function queueCounts(map, localItems) {
     const queued = map.queue ?? [];
-    const known = new Set(queued.map(countKey));
-    const local = new Set((localItems ?? []).map(countKey)); // the same request twice is one request
+    const known = new Set(queued.map(cleanKey));
+    const local = new Set((localItems ?? []).map(cleanKey)); // the same request twice is one request
     const unsent = [...local].filter(key => !known.has(key)).length;
     return {
       researching: queued.filter(item => item.status === 'researching').length,
@@ -238,6 +244,6 @@
 
   return {
     isExpandable, badgeFor, shortLabel, numberCites, pathTo, readingNav,
-    queueKey, cleanQuestion, queueCounts, formatQueue, parseQueue, buildQueueCommand, splitSides, safeStorage,
+    queueKey, cleanQuestion, cleanKey, queueCounts, formatQueue, parseQueue, buildQueueCommand, splitSides, safeStorage,
   };
 });

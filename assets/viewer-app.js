@@ -22,6 +22,7 @@
   const MOVE_MS = 380;
   const GLOW_MS = 1600; // the length of the kmGlow animation in viewer.html
   const FONT_WAIT_MS = 1500;
+  const POST_TIMEOUT_MS = 5000; // a POST /expand with no answer by then is treated as no server
   const LOGO_NAME = /^[a-z0-9]+$/; // a Simple Icons name; any other logo value is not drawn
   const LOGO_URL = 'https://cdn.simpleicons.org/';
   const heightOf = depth => (depth === 0 ? 44 : depth === 1 ? 38 : 32);
@@ -46,13 +47,19 @@
   };
 
   // ---- words ----
+  // The lookup tables are Maps, keyed by values that come from the map: a plain object would answer a name such as
+  // "constructor" from Object.prototype.
   const SEP = ' · ';
   const BUSY_TEXT = 'กำลังรีเสิร์ช…';
   const CHECK_TEXT = 'กำลังตรวจ';
-  const STATUS_TEXT = { planned: 'วางแผนไว้ ยังไม่ได้ขุด', researching: BUSY_TEXT, checking: CHECK_TEXT, done: 'รีเสิร์ชแล้ว', frontier: 'รีเสิร์ชแล้ว ขุดต่อได้' };
-  const CONFIDENCE_TEXT = { high: ['สูง', ''], medium: ['กลาง', 'mid'], low: ['ต่ำ', 'low'] }; // the label and the .kp-conf class
-  const POINT_TYPE_TEXT = { fact: 'ข้อเท็จจริง', opinion: 'ความเห็น', estimate: 'ค่าประมาณ' };
-  const SOURCE_TYPE_TEXT = { official: 'ทางการ', primary: 'ต้นฉบับ', secondary: 'แหล่งรอง', community: 'ชุมชน', video: 'วิดีโอ' };
+  const OLD_TEXT = 'เก่ากว่า 2 ปี';
+  const SENDING_TEXT = 'กำลังส่ง…';
+  const STATUS_TEXT = new Map([
+    ['planned', 'วางแผนไว้ ยังไม่ได้ขุด'], ['researching', BUSY_TEXT], ['checking', CHECK_TEXT], ['done', 'รีเสิร์ชแล้ว'], ['frontier', 'รีเสิร์ชแล้ว ขุดต่อได้'],
+  ]);
+  const CONFIDENCE_TEXT = new Map([['high', ['สูง', '']], ['medium', ['กลาง', 'mid']], ['low', ['ต่ำ', 'low']]]); // the label and the .kp-conf class
+  const POINT_TYPE_TEXT = new Map([['fact', 'ข้อเท็จจริง'], ['opinion', 'ความเห็น'], ['estimate', 'ค่าประมาณ']]);
+  const SOURCE_TYPE_TEXT = new Map([['official', 'ทางการ'], ['primary', 'ต้นฉบับ'], ['secondary', 'แหล่งรอง'], ['community', 'ชุมชน'], ['video', 'วิดีโอ']]);
   const HINT = 'กดโหนดเพื่อกางหรือขุดต่อ · ลากเพื่อเลื่อน · Ctrl + ล้อเมาส์เพื่อซูม';
 
   // ---- helpers ----
@@ -94,6 +101,20 @@
     const time = Date.parse(s);
     if (Number.isNaN(time)) return s;
     return (/^\d{4}-\d{2}-\d{2}$/.test(s) ? dateText.utc : dateText.local).format(time);
+  }
+
+  /**
+   * Whether a source was published more than two calendar years before it was read (spec section 8, rule 4): its
+   * publishedAt is earlier than its accessedAt moved back two years. Dates are read as formatDate reads them, so a bare
+   * YYYY-MM-DD is a day in UTC. No publishedAt, or a date that does not parse, is not old.
+   */
+  function isOld(source) {
+    const published = Date.parse(str(source.publishedAt));
+    const accessed = Date.parse(str(source.accessedAt));
+    if (Number.isNaN(published) || Number.isNaN(accessed)) return false;
+    const limit = new Date(accessed);
+    limit.setUTCFullYear(limit.getUTCFullYear() - 2);
+    return published < limit.getTime();
   }
 
   // ---- boot ----
@@ -243,20 +264,32 @@
     const isBusy = node => node !== map.root && busy.has(node.id);
     const canDig = node => C.isExpandable(node) && !isBusy(node);
 
-    // Marks for a glow the nodes researched since the previous render (none on the first view ever), then makes now the
-    // previous render.
+    // Marks for a glow the nodes researched since the previous render (none on the first view ever).
     function markFresh() {
-      if (seenAt !== null) {
-        for (const { node } of index.values()) if (Date.parse(node.researchedAt) > seenAt) pendingGlow.add(node.id);
-      }
-      seenAt = Date.now();
-      storage.set(SEEN_KEY, seenAt);
+      if (seenAt === null) return;
+      for (const { node } of index.values()) if (Date.parse(node.researchedAt) > seenAt) pendingGlow.add(node.id);
+    }
+
+    // Makes a render that succeeded the previous render, here and in storage for the next page load.
+    function rememberRender(time) {
+      seenAt = time;
+      storage.set(SEEN_KEY, time);
     }
 
     // ---- the offline queue ----
 
-    const isRequest = r => isObj(r) && typeof r.nodeId === 'string' && DIRECTION_TEXT.has(r.direction);
-    const keyOf = r => C.queueKey({ ...r, question: C.cleanQuestion(r.question) });
+    // A request this browser can keep: one whose --queue text (DRCore.formatQueue) reads back as the same request. That
+    // drops an unknown direction, a "question" whose cleaned text is empty, and a node id that is empty or holds ":" or
+    // ";", any of which would make the whole copied command fail to parse.
+    function isRequest(r) {
+      if (!isObj(r) || typeof r.nodeId !== 'string' || !DIRECTION_TEXT.has(r.direction)) return false;
+      try {
+        const [back, ...more] = C.parseQueue(C.formatQueue([r]));
+        return more.length === 0 && back.nodeId === r.nodeId && back.direction === r.direction;
+      } catch {
+        return false;
+      }
+    }
 
     function localItems() {
       const items = storage.get(QUEUE_KEY);
@@ -266,7 +299,7 @@
     /** Adds the request to this browser's queue. false, and nothing stored, when the queue already holds the same one. */
     function addLocal(request) {
       const items = localItems();
-      if (items.some(item => keyOf(item) === keyOf(request))) return false;
+      if (items.some(item => C.cleanKey(item) === C.cleanKey(request))) return false;
       storage.set(QUEUE_KEY, [...items, request]);
       return true;
     }
@@ -408,7 +441,8 @@
         return rootAt;
       };
       const t = animate ? svg.transition('layout').duration(MOVE_MS).ease(d3.easeCubicOut) : null;
-      const moving = sel => (t ? sel.transition(t) : sel);
+      // Without animation, any move still under way is stopped, so it cannot carry a node off after this drawing.
+      const moving = sel => (t ? sel.transition(t) : sel.interrupt('layout'));
 
       const nodeSel = gNodes.selectAll('g.km-node').data(nodes, d => d.data.id);
       const entered = nodeSel.enter().append('g').attr('class', 'km-node').on('click', onNodeClick)
@@ -418,7 +452,7 @@
       all.each(function (d) { drawNode(this, d, keep, now); });
       moving(all).attr('transform', d => `translate(${d.px},${d.x})`).attr('opacity', 1);
       if (t) nodeSel.exit().transition(t).attr('transform', d => translate(endOf(d))).attr('opacity', 0).remove();
-      else nodeSel.exit().remove();
+      else nodeSel.exit().interrupt('layout').remove();
 
       const linkSel = gLinks.selectAll('path.km-link').data(links, l => l.target.data.id);
       const linkEntered = linkSel.enter().append('path').attr('class', 'km-link').attr('d', l => {
@@ -438,7 +472,7 @@
           const p = endOf(l.target);
           return diag(p.x, p.y, p.x, p.y);
         }).remove();
-      } else linkSel.exit().remove();
+      } else linkSel.exit().interrupt('layout').remove();
 
       lastNodes = nodes;
       lastPos = new Map(nodes.map(d => [d.data.id, centre(d)]));
@@ -510,7 +544,7 @@
 
     function shapeIcon(g, name, cls, x) {
       const ig = g.append('g').attr('class', cls).attr('transform', `translate(${x},${-ICON / 2}) scale(${ICON / 24})`);
-      for (const [tag, attrs] of ICONS[name] ?? ICONS.box) {
+      for (const [tag, attrs] of Object.hasOwn(ICONS, name) ? ICONS[name] : ICONS.box) {
         const shape = ig.append(tag);
         for (const [attr, value] of Object.entries(attrs)) shape.attr(attr, value);
       }
@@ -590,8 +624,8 @@
       if (me) moveTo(boundsOf([me]), d3.zoomTransform(svgEl).k);
     }
 
-    function refresh() {
-      update();
+    function refresh(options) {
+      update(options);
       renderPanel();
       renderBar();
     }
@@ -646,10 +680,11 @@
       askForm.hidden = true;
       askInput.value = '';
       askSend.disabled = true;
-      menuNote.textContent = '';
+      // While an earlier request is still on its way, this menu waits too: its buttons come back when that one is done.
+      menuNote.textContent = sending ? SENDING_TEXT : '';
       for (const b of dirButtons) {
         b.classList.remove('on');
-        b.disabled = false;
+        b.disabled = sending;
       }
       menuEl.classList.toggle('in-panel', anchor === 'panel');
       menuEl.hidden = false;
@@ -700,7 +735,7 @@
       sending = on;
       for (const b of dirButtons) b.disabled = on;
       askSend.disabled = on || C.cleanQuestion(askInput.value) === '';
-      menuNote.textContent = on ? 'กำลังส่ง…' : '';
+      menuNote.textContent = on ? SENDING_TEXT : '';
     }
 
     menuEl.addEventListener('click', e => {
@@ -765,25 +800,35 @@
       }
     }
 
+    // POSTs the request. A server that gives no answer within POST_TIMEOUT_MS counts as no server at all: the request is
+    // aborted and the result is 'unsent', so it goes to this browser's queue.
     async function post(request) {
       const sentAt = Date.now();
-      let res;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), POST_TIMEOUT_MS);
       try {
-        res = await fetch('/expand', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(request) });
-      } catch {
-        return { kind: 'unsent' };
+        let res;
+        try {
+          res = await fetch('/expand', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(request), signal: controller.signal,
+          });
+        } catch {
+          return { kind: 'unsent' }; // a network error, or no answer in time
+        }
+        if (res.status >= 500) return { kind: 'unsent' };
+        let body = null;
+        try {
+          body = await res.json();
+        } catch {
+          // no JSON body (or the time ran out while it came): the status still says what happened
+        }
+        if (res.status === 202 || res.status === 200) {
+          return { kind: 'accepted', id: typeof body?.id === 'string' ? body.id : `unnamed-${sentAt}`, sentAt };
+        }
+        return { kind: 'refused', message: typeof body?.error === 'string' ? body.error : `HTTP ${res.status}` };
+      } finally {
+        clearTimeout(timer);
       }
-      if (res.status >= 500) return { kind: 'unsent' };
-      let body = null;
-      try {
-        body = await res.json();
-      } catch {
-        // no JSON body: the status still says what happened
-      }
-      if (res.status === 202 || res.status === 200) {
-        return { kind: 'accepted', id: typeof body?.id === 'string' ? body.id : `unnamed-${sentAt}`, sentAt };
-      }
-      return { kind: 'refused', message: typeof body?.error === 'string' ? body.error : `HTTP ${res.status}` };
     }
 
     // ---- the panel ----
@@ -803,13 +848,13 @@
     function claimList(claims, cites, { types = false } = {}) {
       return h('ul', { class: 'kp-ul' }, list(claims).filter(isObj).map(claim => h('li', { class: claim.key === true ? 'key' : null },
         str(claim.text),
-        types && POINT_TYPE_TEXT[claim.type] ? [' ', h('span', { class: `kp-tag t-${claim.type}`, text: POINT_TYPE_TEXT[claim.type] })] : null,
+        types && POINT_TYPE_TEXT.has(claim.type) ? [' ', h('span', { class: `kp-tag t-${claim.type}`, text: POINT_TYPE_TEXT.get(claim.type) })] : null,
         claim.singleSource === true ? [' ', h('span', { class: 'kp-tag single', text: 'แหล่งเดียว' })] : null,
         citeLinks(claim.cites, cites))));
     }
 
     // The sources a node cites, numbered as DRCore.numberCites numbers them. A link only for an http(s) url, and it opens
-    // in a new tab.
+    // in a new tab. A source more than two years older than its reading is tagged (isOld).
     function sourceList(cites) {
       if (!cites.order.length) return [];
       const sources = isObj(map.sources) ? map.sources : {};
@@ -818,9 +863,11 @@
         const title = (s && (str(s.title) || str(s.url))) || str(id);
         const name = s && isWebUrl(s.url) ? h('a', { href: s.url, target: '_blank', rel: 'noopener' }, title) : h('span', { text: title });
         const meta = s
-          ? [str(s.publisher), SOURCE_TYPE_TEXT[s.type], s.publishedAt && `เผยแพร่ ${formatDate(s.publishedAt)}`, s.accessedAt && `เข้าถึง ${formatDate(s.accessedAt)}`]
+          ? [str(s.publisher), SOURCE_TYPE_TEXT.get(s.type), s.publishedAt && `เผยแพร่ ${formatDate(s.publishedAt)}`, s.accessedAt && `เข้าถึง ${formatDate(s.accessedAt)}`]
           : ['ไม่พบแหล่งนี้ในแผนที่'];
-        return h('div', { id: `src-${id}` }, h('span', { class: 'kp-n', text: `[${i + 1}]` }), ' ', name, h('small', { text: meta.filter(Boolean).join(SEP) }));
+        return h('div', { id: `src-${id}` }, h('span', { class: 'kp-n', text: `[${i + 1}]` }), ' ', name,
+          s && isOld(s) ? [' ', h('span', { class: 'kp-tag old', text: OLD_TEXT })] : null,
+          h('small', { text: meta.filter(Boolean).join(SEP) }));
       }))];
     }
 
@@ -871,7 +918,7 @@
       const parts = [h('div', { class: 'kp-kind', style: { '--c': zone?.color ?? ROOT_COLOR }, text: zone?.label ?? '' }), h('h3', { text: titleOf(node) })];
       const trail = C.pathTo(map.root, node.id).slice(1, -1).map(titleOf);
       if (trail.length) parts.push(h('div', { class: 'kp-path', text: trail.join(' › ') }));
-      const status = isBusy(node) ? BUSY_TEXT : STATUS_TEXT[node.status];
+      const status = isBusy(node) ? BUSY_TEXT : STATUS_TEXT.get(node.status);
       const meta = [status, node.researchedAt ? `รีเสิร์ชเมื่อ ${formatDate(node.researchedAt)}` : ''].filter(Boolean);
       if (meta.length) parts.push(h('div', { class: 'kp-meta', text: meta.join(SEP) }));
       if (node.summary) parts.push(h('p', { class: 'kp-sum', text: str(node.summary) }));
@@ -879,7 +926,7 @@
       if (node.forYou) parts.push(h('div', { class: 'kp-foryou' }, h('div', { class: 'kp-foryou-h', text: 'สำหรับคุณ' }), h('p', { text: str(node.forYou) })));
       const cites = C.numberCites(node);
       if (list(node.points).length) parts.push(section('สิ่งที่ควรรู้'), claimList(node.points, cites, { types: true }));
-      const confidence = CONFIDENCE_TEXT[node.confidence];
+      const confidence = CONFIDENCE_TEXT.get(node.confidence);
       if (confidence) {
         parts.push(section('ความมั่นใจ', h('span', { class: `kp-conf ${confidence[1]}`.trim(), text: confidence[0] })));
         if (node.confidenceReason) parts.push(h('p', { class: 'kp-reason', text: str(node.confidenceReason) }));
@@ -910,10 +957,18 @@
       const node = nodeOf(selectedId) ?? map.root;
       const same = panel.getAttribute('data-node') === node.id;
       const scroll = same ? panel.scrollTop : 0;
+      // The menu moves into the new panel, and a moved element loses the focus: whoever is typing a question keeps it.
+      const typing = menuEl.contains(document.activeElement) ? document.activeElement : null;
+      const caret = typing && typeof typing.selectionStart === 'number'
+        ? [typing.selectionStart, typing.selectionEnd, typing.selectionDirection ?? 'none'] : null;
       const parts = node === map.root ? rootParts() : nodeParts(node);
       panel.replaceChildren(...[readingBar(), ...parts].filter(Boolean));
       panel.setAttribute('data-node', node.id);
       panel.scrollTop = scroll;
+      if (typing && panel.contains(typing) && document.activeElement !== typing) {
+        typing.focus({ preventScroll: true });
+        if (caret) typing.setSelectionRange(...caret);
+      }
     }
 
     panel.addEventListener('click', e => {
@@ -1045,25 +1100,50 @@
     // ---- live mode ----
 
     // Takes in a newer map, keeping what the reader opened, selected and zoomed. A node that has just grown its first
-    // children opens, so the new branches show.
+    // children opens, so the new branches show. A map that cannot be drawn (it parsed, but has a shape the viewer cannot
+    // draw) changes nothing for good: the error goes to the console, the earlier map and the reader's state come back,
+    // and the last good map is drawn again, so the page keeps working on it.
     function applyMap(next) {
-      const hadKids = new Map([...index].map(([id, entry]) => [id, hasKids(entry.node)]));
-      map = next;
-      reindex();
-      for (const [id, { node }] of index) if (hadKids.get(id) === false && hasKids(node)) collapsed.set(id, false);
-      const queued = new Set(list(map.queue).filter(isObj).map(item => item.id));
-      for (const [id, request] of accepted) {
-        const node = nodeOf(request.nodeId);
-        const doneSince = node && (Date.parse(node.researchedAt) >= request.at
-          || list(node.expansions).some(x => isObj(x) && Date.parse(x.at) >= request.at));
-        if (queued.has(id) || !node || doneSince) accepted.delete(id);
+      const renderedAt = Date.now();
+      const before = {
+        map, index, selectedId, readingId,
+        collapsed: new Map(collapsed), accepted: new Map(accepted), pendingGlow: new Set(pendingGlow), glowUntil: new Map(glowUntil),
+      };
+      try {
+        const hadKids = new Map([...index].map(([id, entry]) => [id, hasKids(entry.node)]));
+        map = next;
+        reindex();
+        for (const [id, { node }] of index) if (hadKids.get(id) === false && hasKids(node)) collapsed.set(id, false);
+        const queued = new Set(list(map.queue).filter(isObj).map(item => item.id));
+        for (const [id, request] of accepted) {
+          const node = nodeOf(request.nodeId);
+          const doneSince = node && (Date.parse(node.researchedAt) >= request.at
+            || list(node.expansions).some(x => isObj(x) && Date.parse(x.at) >= request.at));
+          if (queued.has(id) || !node || doneSince) accepted.delete(id);
+        }
+        if (!index.has(selectedId)) selectedId = map.root.id;
+        if (readingId !== null && !index.has(readingId)) readingId = null;
+        markFresh();
+        busy = busyNodeIds();
+        if (menu && !(nodeOf(menu.nodeId) && canDig(nodeOf(menu.nodeId)))) closeMenu();
+        refresh();
+      } catch (err) {
+        console.error('deep-research: the new map.json could not be drawn, so the last good map stays.', err);
+        ({ map, index, selectedId, readingId } = before);
+        refill(collapsed, before.collapsed);
+        refill(accepted, before.accepted);
+        refill(glowUntil, before.glowUntil);
+        pendingGlow.clear();
+        for (const id of before.pendingGlow) pendingGlow.add(id);
+        refresh({ animate: false });
+        return;
       }
-      if (!index.has(selectedId)) selectedId = map.root.id;
-      if (readingId !== null && !index.has(readingId)) readingId = null;
-      markFresh();
-      busy = busyNodeIds();
-      if (menu && !(nodeOf(menu.nodeId) && canDig(nodeOf(menu.nodeId)))) closeMenu();
-      refresh();
+      rememberRender(renderedAt);
+    }
+
+    function refill(target, source) {
+      target.clear();
+      for (const [key, value] of source) target.set(key, value);
     }
 
     let fetching = false;
@@ -1074,36 +1154,33 @@
         return;
       }
       fetching = true;
+      let next = null;
       try {
         const res = await fetch('/map.json', { cache: 'no-store' });
-        if (res.ok) {
-          const next = await res.json();
-          if (isObj(next) && isObj(next.root)) applyMap(next);
-        }
+        if (res.ok) next = await res.json();
       } catch {
-        // keep the map we have; the event stream shows when the server is gone
+        // no server, or no JSON: keep the map we have (the event stream shows when the server is gone)
       } finally {
         fetching = false;
       }
-      if (fetchAgain) {
-        fetchAgain = false;
-        reload();
+      try {
+        if (isObj(next) && isObj(next.root)) applyMap(next);
+      } finally {
+        if (fetchAgain) {
+          fetchAgain = false;
+          reload();
+        }
       }
     }
 
     function listen() {
       if (typeof EventSource !== 'function') return;
       const events = new EventSource('/events');
-      let lost = false;
       events.addEventListener('open', () => {
         offlineEl.hidden = true;
-        if (lost) {
-          lost = false;
-          reload(); // map changes may have been missed while the stream was down
-        }
+        reload(); // map.json may have changed before the stream opened, or while it was down
       });
       events.addEventListener('error', () => {
-        lost = true;
         offlineEl.hidden = false;
       });
       events.addEventListener('map', () => reload());
@@ -1128,12 +1205,14 @@
       h('span', { class: 'more', text: 'วงประ + = กดแล้วขุดลึกต่อได้' }),
       h('span', { class: 'plan', text: 'เส้นประ = วางแผนไว้ ยังไม่ได้ขุด' }));
     canvas.append(h('div', { class: 'dr-hint', text: HINT }), menuEl);
+    const firstRender = Date.now();
     reindex();
     markFresh();
     update({ animate: false });
     renderPanel();
     renderBar();
     fit(false);
+    rememberRender(firstRender);
     if (document.fonts && typeof document.fonts.addEventListener === 'function') {
       document.fonts.addEventListener('loadingdone', () => update()); // a font that came late changes the label widths
     }
