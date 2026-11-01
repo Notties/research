@@ -107,6 +107,11 @@ test('inlines libraries', () => {
   for (const text of ['7.9.0', 'DRShared', 'DRCore', 'DRApp']) assert.ok(html.includes(text), text);
 });
 
+test('the vendored d3 is the 279706-byte build of the global constraint', () => {
+  // .gitattributes keeps these bytes on any checkout (assets/vendor/** -text), even with core.autocrlf=true.
+  assert.equal(fs.statSync(path.join(ASSETS, 'vendor', 'd3.min.js')).size, 279706);
+});
+
 // ---- the page stays whole ----
 
 test('the page keeps its scripts whole and in running order, whatever the map says', () => {
@@ -131,8 +136,8 @@ test('the scripts run in order and the app boots, whatever the map says', () => 
   assert.equal(document.title, ''); // nothing happens before DOMContentLoaded
   assert.deepEqual(Object.keys(listeners), ['DOMContentLoaded']);
   listeners.DOMContentLoaded();
-  assert.equal(document.title, TITLE_PREFIX + m.topic);
-  assert.equal(elements['dr-title'].textContent, TITLE_PREFIX + m.topic);
+  assert.equal(document.title, TITLE_PREFIX + m.topic); // the page title has the prefix, the top bar shows the topic alone
+  assert.equal(elements['dr-title'].textContent, m.topic);
 });
 
 test('the app boots at once when the page has already loaded', () => {
@@ -140,7 +145,7 @@ test('the app boots at once when the page has already loaded', () => {
   const { document, elements, listeners } = runPage(renderIndexHtml(m), 'interactive');
   assert.deepEqual(Object.keys(listeners), []);
   assert.equal(document.title, TITLE_PREFIX + m.topic);
-  assert.equal(elements['dr-title'].textContent, TITLE_PREFIX + m.topic);
+  assert.equal(elements['dr-title'].textContent, m.topic);
 });
 
 test('the shipped scripts hold no "<!--", which would let the browser swallow the closing tag', () => {

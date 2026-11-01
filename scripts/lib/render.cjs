@@ -17,7 +17,7 @@ const TEMPLATE = 'viewer.html';
 // the order here is the order of the holes in the template.
 const SCRIPTS = { D3: 'vendor/d3.min.js', SHARED: 'shared.js', CORE: 'viewer-core.js', APP: 'viewer-app.js' };
 const HOLE = /<!--DR:(TITLE|MODE|D3|SHARED|CORE|APP|DATA)-->/g;
-const TITLE_PREFIX = 'แผนที่ความรู้: '; // viewer-app.js sets the same title
+const TITLE_PREFIX = 'แผนที่ความรู้: '; // viewer-app.js puts the same prefix on document.title
 
 const readAsset = file => fs.readFileSync(path.join(ASSETS, file), 'utf8');
 
