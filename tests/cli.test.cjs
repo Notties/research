@@ -243,17 +243,34 @@ function lockTakenOver() {
   };
 }
 
-// Removing the lock file is refused, as Windows does for a file that something has open.
-function unremovableLock() {
+// The first DR_TEST_REFUSED_DELETES deletes of a file are refused, with the error code in DR_TEST_REFUSE_CODE (EPERM when there is none),
+// and the rest go through: Windows refusing a delete for a moment while something has the file open, and then no more. The file is the one
+// whose path ends with DR_TEST_REFUSE_FILE (the lock, map.json.lock, when there is none). The options a delete carries make no difference,
+// as for a real file, where node's rmSync ignores maxRetries and retryDelay. Each delete of that file leaves a line in the file that
+// DR_TEST_NOTE names, its time in milliseconds, so that a test can count the tries and see the pauses between them.
+function refuseLockDeletes() {
   const fs = require('node:fs');
   const remove = fs.rmSync;
-  fs.rmSync = function unremovableRemove(file) {
-    if (String(file).endsWith('map.json.lock')) {
-      throw Object.assign(new Error(`EPERM: operation not permitted, unlink '${file}'`), { code: 'EPERM', syscall: 'unlink', path: file });
-    }
-    return remove.apply(this, arguments);
+  let calls = 0;
+  fs.rmSync = function refusingRemove(file) {
+    if (!String(file).endsWith(process.env.DR_TEST_REFUSE_FILE || 'map.json.lock')) return remove.apply(this, arguments);
+    calls += 1;
+    if (process.env.DR_TEST_NOTE) fs.appendFileSync(process.env.DR_TEST_NOTE, `${Date.now()}\n`);
+    if (calls > Number(process.env.DR_TEST_REFUSED_DELETES)) return remove.apply(this, arguments);
+    const code = process.env.DR_TEST_REFUSE_CODE || 'EPERM';
+    throw Object.assign(new Error(`${code}: operation not permitted, unlink '${file}'`), { code, syscall: 'unlink', path: file });
   };
 }
+// The options for dr() that refuse the first `refused` deletes of `file` (the lock, or map.json.lock.break) with `code`, and the note file
+// that counts the deletes.
+function refusingDeletes(w, refused, { code = 'EPERM', file = 'map.json.lock' } = {}) {
+  const note = path.join(w.work, `delete-calls-${refused}-${code}-${file}.txt`);
+  fs.rmSync(note, { force: true });
+  const env = { DR_TEST_REFUSED_DELETES: String(refused), DR_TEST_REFUSE_CODE: code, DR_TEST_REFUSE_FILE: file, DR_TEST_NOTE: note };
+  return { ...preload(w, refuseLockDeletes, env), note };
+}
+const deleteTimes = options => (textIfThere(options.note) ?? '').split('\n').filter(Boolean).map(Number);
+const deleteCalls = options => deleteTimes(options).length;
 
 // The first two reads of the lock file are refused with EBUSY, as Windows can for a moment while something else has the file open.
 function flakyLockRead() {
@@ -320,20 +337,6 @@ function noteBreakAttempts() {
   fs.writeFileSync = function notingWrite(file, data, options) {
     if (String(file).endsWith('map.json.lock.break') && options?.flag === 'wx') fs.appendFileSync(process.env.DR_TEST_NOTE, 'attempt\n');
     return write.apply(this, arguments);
-  };
-}
-
-// Removing the lock file is refused with EPERM unless the call asks for retries. That is the model of a refusal that passes within
-// moments, as Windows gives while something has the file open: rmSync with maxRetries tries again, and one without them fails at the
-// first. The retrying itself is node's, so the stub only tells a call that has retries from one that has none.
-function transientRemoveRefusal() {
-  const fs = require('node:fs');
-  const remove = fs.rmSync;
-  fs.rmSync = function transientRemove(file, options) {
-    if (String(file).endsWith('map.json.lock') && !(options?.maxRetries >= 1)) {
-      throw Object.assign(new Error(`EPERM: operation not permitted, unlink '${file}'`), { code: 'EPERM', syscall: 'unlink', path: file });
-    }
-    return remove.apply(this, arguments);
   };
 }
 
@@ -1417,14 +1420,79 @@ test('a command that holds the break file and finds a fresh lock in place of the
   assert.deepEqual(listing(w.dir), TOPIC_FILES);
 });
 
-test('a stale lock is removed with retries, so that a refusal that passes within moments does not abort the command', t => {
+test('a delete of the lock that is refused for a moment is tried again, when a stale lock is broken and when a lock is released', t => {
   const w = initialized(t);
-  makeStale(inFolder(w.dir, 'map.json.lock'), '4242\n');
-  const run = dr(['mark-checked', w.dir], preload(w, transientRemoveRefusal));
-  assert.equal(run.status, 0, run.stdout + run.stderr);
-  assert.deepEqual(run.json, { changed: 0 });
-  assert.equal(run.stderr, '');
-  assert.deepEqual(listing(w.dir), TOPIC_FILES);
+  for (const stale of [true, false]) {
+    for (const refused of [2, 4]) {
+      const what = `${stale ? 'breaking a stale lock' : 'releasing a lock'}, the first ${refused} deletes refused`;
+      if (stale) makeStale(inFolder(w.dir, 'map.json.lock'), '4242\n');
+      const options = refusingDeletes(w, refused);
+      const run = dr(['mark-checked', w.dir], options);
+      assert.equal(run.status, 0, `${what}: ${run.stdout}${run.stderr}`);
+      assert.deepEqual(run.json, { changed: 0 }, what);
+      assert.equal(run.stderr, '', what);
+      assert.deepEqual(listing(w.dir), TOPIC_FILES, `${what}: the lock is gone`);
+      // The refused deletes, the one that went through, and, after a stale lock, the release of the lock that took its place.
+      assert.equal(deleteCalls(options), refused + 1 + (stale ? 1 : 0), `${what}: the tries`);
+    }
+  }
+});
+
+test('a delete that stays refused makes breaking a stale lock fail after 5 tries, with the lock left as it was', t => {
+  const w = initialized(t);
+  const lock = inFolder(w.dir, 'map.json.lock');
+  makeStale(lock, '4242\n');
+  const options = refusingDeletes(w, 5); // all 5 tries
+  const run = dr(['mark-checked', w.dir], options);
+  assert.equal(run.status, 1);
+  assert.match(run.json.error, /^EPERM: operation not permitted, unlink .*map\.json\.lock/);
+  assert.equal(deleteCalls(options), 5, 'five tries and no more');
+  assert.equal(textIfThere(lock), '4242\n', 'the stale lock is still there');
+  assert.equal(fs.existsSync(inFolder(w.dir, 'map.json.lock.break')), false, 'the break file was let go');
+  // A pause between the tries that grows: 20, 40, 60 and 80 ms. Only lower bounds, at half of each, since a pause can be longer on a busy
+  // machine but not much shorter. A helper that does not wait, or waits the same time every time, is below them.
+  const times = deleteTimes(options);
+  const gaps = times.slice(1).map((time, i) => time - times[i]);
+  assert.equal(gaps.length, 4);
+  gaps.forEach((gap, i) => assert.ok(gap >= 10 * (i + 1), `the pause after try ${i + 1} was ${gap} ms, and should be about ${20 * (i + 1)}`));
+});
+
+test('the break file is deleted with the same tries, and one that stays does not stop the command', t => {
+  const w = initialized(t);
+  const lock = inFolder(w.dir, 'map.json.lock');
+  makeStale(lock, '4242\n');
+  const retried = refusingDeletes(w, 2, { file: 'map.json.lock.break' });
+  const first = dr(['mark-checked', w.dir], retried);
+  assert.equal(first.status, 0, first.stdout + first.stderr);
+  assert.equal(deleteCalls(retried), 3, 'two refused, then the third went through');
+  assert.deepEqual(listing(w.dir), TOPIC_FILES, 'no break file is left');
+
+  makeStale(lock, '4242\n');
+  const stuck = refusingDeletes(w, 5, { file: 'map.json.lock.break' });
+  const second = dr(['mark-checked', w.dir], stuck);
+  assert.equal(second.status, 0, second.stdout + second.stderr); // the lock was broken and the command ran: a break file that stays is stale in 30 s
+  assert.deepEqual(second.json, { changed: 0 });
+  assert.equal(deleteCalls(stuck), 5, 'five tries and no more');
+  assert.deepEqual(listing(w.dir), [...TOPIC_FILES, 'map.json.lock.break'].sort(), 'the break file stayed, and nothing else');
+});
+
+test('a delete that is refused for another reason than a busy file is not tried again', t => {
+  const w = initialized(t);
+  const lock = inFolder(w.dir, 'map.json.lock');
+  makeStale(lock, '4242\n');
+  const breaking = refusingDeletes(w, 99, { code: 'EROFS' });
+  const broke = dr(['mark-checked', w.dir], breaking);
+  assert.equal(broke.status, 1);
+  assert.match(broke.json.error, /^EROFS: /);
+  assert.equal(deleteCalls(breaking), 1, 'one try');
+  fs.rmSync(lock);
+
+  const releasing = refusingDeletes(w, 99, { code: 'EROFS' });
+  const released = dr(['mark-checked', w.dir], releasing);
+  assert.equal(released.status, 0, released.stdout + released.stderr);
+  assert.deepEqual(released.json, { changed: 0 });
+  assert.match(released.stderr, /^dr\.cjs: warning: could not remove map\.json\.lock \(EROFS\)/);
+  assert.equal(deleteCalls(releasing), 1, 'one try');
 });
 
 test('a command whose lock was taken over or removed while it worked leaves the other lock alone, says so, and still ends well', t => {
@@ -1466,7 +1534,9 @@ test('a lock whose read is refused for a moment is still released, so that it do
 test('a lock that cannot be removed does not turn a command that finished into a failure', t => {
   const w = initialized(t);
   const file = writeJson(path.join(w.work, 'fragment.json'), fragment());
-  const run = dr(mergeArgs(w, file), preload(w, unremovableLock));
+  const options = refusingDeletes(w, 5); // all 5 tries of the release
+  const run = dr(mergeArgs(w, file), options);
+  assert.equal(deleteCalls(options), 5, 'five tries and no more');
   assert.equal(run.status, 0, run.stdout + run.stderr);
   assert.deepEqual(run.json, { added: ['g-know-1-1', 'g-know-1-2'] }); // told, so that nobody merges the fragment a second time
   assert.match(run.stderr, /^dr\.cjs: warning: could not remove map\.json\.lock \(EPERM\)/);

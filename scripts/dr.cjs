@@ -180,9 +180,8 @@ const LOCK_WAIT_MS = 10000;
 const LOCK_STALE_MS = 30000;
 // Why a lock cannot be taken right now: it exists (EEXIST), or Windows is in the middle of deleting it (EPERM, EACCES, EBUSY).
 const LOCK_BUSY = ['EEXIST', 'EPERM', 'EACCES', 'EBUSY'];
-// How a lock file is deleted, by the command that releases it and by one that breaks a stale one: Windows can refuse a delete for a moment
-// while something has the file open (EPERM, EBUSY), and rmSync tries again with these.
-const REMOVE_LOCK = { force: true, maxRetries: 5, retryDelay: 20 };
+const REMOVE_TRIES = 5;
+const REMOVE_PAUSE_MS = 20; // times the number of the try that was refused: 20, 40, 60 and 80 ms
 const pause = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); // a synchronous sleep
 const warn = text => process.stderr.write(`dr.cjs: warning: ${text}\n`);
 
@@ -194,6 +193,22 @@ function lockStat(file) {
     return { age: Date.now() - Number(stat.mtimeMs), mark: `${stat.ino}:${stat.mtimeNs}` };
   } catch {
     return null;
+  }
+}
+
+// Deletes a lock file or a break file. Windows refuses a delete for a moment while something else has the file open (EPERM, EBUSY, EACCES), so a
+// refusal is tried again after a pause that grows (20, 40, 60 and 80 ms), for up to 5 tries, and then the last error is thrown. A file that is not
+// there is fine. This is done here because fs.rmSync does not do it: for a file it ignores maxRetries and retryDelay (only the asynchronous
+// fs.rm retries) and fails at the first refusal.
+function removeLockFile(file) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      fs.rmSync(file, { force: true });
+      return;
+    } catch (err) {
+      if (attempt === REMOVE_TRIES || !LOCK_BUSY.includes(err.code)) throw err;
+      pause(REMOVE_PAUSE_MS * attempt);
+    }
   }
 }
 
@@ -217,21 +232,21 @@ function breakStaleLock(lock) {
   } catch (err) {
     if (!LOCK_BUSY.includes(err.code)) throw err;
     if ((lockStat(breaking)?.age ?? 0) > LOCK_STALE_MS) {
-      try { fs.rmSync(breaking, { force: true }); } catch { /* the next try finds it again */ }
+      try { removeLockFile(breaking); } catch { /* the next try finds it again */ }
     }
     return false;
   }
   try {
     const now = lockStat(lock);
-    if (now !== null && now.mark === judged.mark && now.age > LOCK_STALE_MS) fs.rmSync(lock, REMOVE_LOCK);
+    if (now !== null && now.mark === judged.mark && now.age > LOCK_STALE_MS) removeLockFile(lock);
   } finally {
-    try { fs.rmSync(breaking, { force: true }); } catch { /* a break file that stays is stale after 30 s */ }
+    try { removeLockFile(breaking); } catch { /* a break file that stays is stale after 30 s */ }
   }
   return true;
 }
 
-// The text of the lock file, or null when there is none. Windows can refuse a read for a moment (what the removal below is also given
-// retries for), and a lock that is not released blocks the next command, so a refusal is tried again a few times.
+// The text of the lock file, or null when there is none. Windows can refuse a read for a moment, as it can a delete (removeLockFile), and a
+// lock that is not released blocks the next command, so a refusal is tried again a few times.
 function readLock(lock) {
   for (let attempt = 1; ; attempt++) {
     try {
@@ -257,7 +272,7 @@ function releaseLock(lock, token) {
       warn(`${LOCK_FILE} was taken over while this command held it, since a lock is broken after ${LOCK_STALE_MS / 1000} s, `
         + 'so it was left alone; what this command saved may have been overwritten');
     } else {
-      fs.rmSync(lock, REMOVE_LOCK);
+      removeLockFile(lock);
     }
   } catch (err) {
     // The next command meets a lock that is not stale yet: it waits LOCK_WAIT_MS for it and then fails, and the first one to come after
