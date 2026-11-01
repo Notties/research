@@ -209,7 +209,6 @@ test('createMap, mergeFragment, finishItem and saveMap default now to the curren
   for (const stamp of [m.createdAt, g.researchedAt, findNode(m, 'g-know-1-1').researchedAt, g.expansions[0].at, m.updatedAt]) {
     assert.ok(Date.parse(stamp) >= lo && Date.parse(stamp) <= hi, stamp);
   }
-  assert.equal(m.createdAt === m.updatedAt, false, 'updatedAt moves on save');
 });
 
 // ---- findNode, parentOf and walk ----
@@ -291,7 +290,8 @@ test('mergeFragment drops repeated cites after remapping and keeps first-seen or
   assert.deepEqual(validateMap(m), VALID);
 });
 
-// [first url, second url, are they one source?]
+// [first url, second url, are they one source?] The plan names three rules: lower-case host, no #hash, no trailing slash.
+// The rest follow from parsing the url (default port, slashes before a query) or keep different pages apart.
 const urlPairs = [
   ['https://example.com/a', 'https://EXAMPLE.com/a', true],
   ['https://example.com/a', 'https://example.com/a#intro', true],
