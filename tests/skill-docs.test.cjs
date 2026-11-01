@@ -194,31 +194,22 @@ test('expansion explains the offline queue and why its items stay on one origin'
 
 // ---- rigor.md ----
 
-// Spec section 8, rules 1 to 8, as the spec words them. rigor.md copies them, so this is a copy of a copy: if one changes,
-// the other must change with it.
-const RULES = [
-  '**ลำดับแหล่ง:** เอกสารทางการ สเปก หรือผู้เขียนต้นฉบับ → สื่อหรืองานวิจัยที่น่าเชื่อถือ → ชุมชนที่เป็นที่ยอมรับ เช่น บล็อกที่มีชื่อ หรือ repo ที่ยังมีคนดูแล → ฟอรัมและวิดีโอ ซึ่งใช้ดูมุมมองคนทำงานจริงได้ แต่ห้ามเป็นแหล่งเดียวของข้อเท็จจริง',
-  'ทุก point ต้องมีอ้างอิงอย่างน้อย 1 แหล่ง ข้อสำคัญต้องมีอย่างน้อย 2 แหล่งที่เป็นอิสระต่อกัน ถ้ามีแหล่งเดียวต้องติดป้ายว่า "แหล่งเดียว" และลดระดับความมั่นใจ ข้อสำคัญได้แก่ ข้อที่อยู่ในสรุป 1 นาที คำแนะนำ และตัวเลข',
-  'อ้างอิงได้เฉพาะ URL ที่เปิดอ่านจริงในการรีเสิร์ชครั้งนั้น ห้ามอ้างจากความจำ',
-  'บันทึกวันที่เผยแพร่ (ถ้ามี) และวันที่เข้าถึง หัวข้อที่เปลี่ยนเร็วให้ติดป้ายข้อมูลที่เก่ากว่าประมาณ 2 ปี',
-  'ถ้าแหล่งขัดกัน ให้แสดงทั้งสองฝั่งพร้อมอ้างอิงใน `conflicts`',
-  'แยกป้ายข้อเท็จจริง ความเห็น และค่าประมาณ',
-  '**ระดับความมั่นใจ:**',
-  'สูง: แหล่งแข็งแรงอย่างน้อย 2 แหล่งเห็นตรงกัน',
-  'กลาง: แหล่งแข็งแรง 1 แหล่ง หรือแหล่งอ่อนหลายแหล่ง',
-  'ต่ำ: แหล่งอ่อน หรือแหล่งขัดกัน',
-  'ทุกระดับต้องมีเหตุผลกำกับ',
-  'เรื่องที่ยังสรุปไม่ได้ให้ใส่ไว้ในกลุ่ม "คำถามที่ยังเปิดอยู่"',
-];
+// rigor.md copies section 8 of the design spec, which lives beside the skill's repository in C:\_research\docs. The test
+// reads the spec itself and compares whole lines, so there is no second typed copy that could drift. It is skipped, and
+// says so, on a machine that does not have the spec; DR_SPEC names another place for it.
+const SPEC = process.env.DR_SPEC ?? path.join(ROOT, '..', '..', 'docs', 'superpowers', 'specs', '2026-11-01-deep-research-skill-design.md');
 
-test('rigor copies spec section 8 rules 1 to 8 word for word, in order', () => {
-  const text = doc('rigor.md');
-  let from = 0;
-  for (const rule of RULES) {
-    const at = text.indexOf(rule, from);
-    assert.ok(at !== -1, `rule text missing or out of order: ${rule.slice(0, 40)}`);
-    from = at + rule.length;
-  }
+test('rigor copies spec section 8 rules 1 to 8 line for line', { skip: !fs.existsSync(SPEC) && `the design spec is not at ${SPEC} (DR_SPEC names it)` }, () => {
+  const spec = fs.readFileSync(SPEC, 'utf8').split(/\r?\n/);
+  const heading = spec.findIndex(line => /^## 8\. /.test(line));
+  assert.ok(heading !== -1, 'the spec has a section 8');
+  const next = spec.findIndex((line, i) => i > heading && line.startsWith('## '));
+  const rules = spec.slice(heading + 1, next === -1 ? undefined : next).filter(line => line.trim() !== '');
+  assert.ok(rules.length >= 8, 'section 8 holds its 8 rules');
+  const lines = doc('rigor.md').split('\n');
+  const at = lines.indexOf(rules[0]);
+  assert.ok(at !== -1, `rigor.md has the first line of section 8 whole: ${rules[0].slice(0, 40)}`);
+  assert.deepEqual(lines.slice(at, at + rules.length), rules, 'rigor.md holds the lines of section 8 whole, in order, one after the other');
 });
 
 test('rigor says how each rule is encoded in the data', () => {
@@ -268,11 +259,173 @@ test('brief tells the subagent which tools to use, what to record and how to ans
   for (const word of [
     'WebSearch', 'WebFetch', 'agent-reach read', 'agent-reach channels', // the three ways to search and read
     'accessedAt', 'publishedAt', 'counterpoints', 'conflicts', 'singleSource', 'confidenceReason',
-    'เบราว์เซอร์ในแอป', 'ปิดแท็บ', // the in-app browser only for pages WebFetch cannot render, in a tab of its own
+    // The in-app browser only for pages WebFetch cannot render, in a tab of its own that is closed. Not just "ปิดแท็บ": that
+    // is also inside "เปิดแท็บ", which opens one.
+    'เบราว์เซอร์ในแอป', 'ปิดแท็บของตัวเองด้วย `tabs_close`',
     'ภาษาไทย', 'Write',
     'วันที่วันนี้', // accessedAt is the date SKILL.md passes in, not one that a subagent guesses
   ]) assert.ok(text.includes(word), word);
   assert.ok(doc('subagent-brief.md').includes('"- วันที่วันนี้: YYYY-MM-DD"'), 'the assembly steps tell Claude to end {{BRIEF}} with the date');
+});
+
+// ---- the safety rules of the template ----
+// Subagents read pages from anywhere, and a page can carry text meant for them. What the template forbids is pinned one
+// rule at a time. A numbered rule is found by its number inside the section "กฎที่ต้องทำตามเสมอ", so deleting a rule,
+// or the words that make it a rule, fails a test.
+
+// The read-only agent-reach actions that rule 11 allows, as it writes them. This is the whole list: a command that is not
+// here is not allowed, and a test below checks each of these against the real agent-reach.
+const AGENT_REACH_ALLOWED = [
+  'agent-reach channels',
+  'agent-reach doctor --text',
+  'agent-reach read <url>',
+  'agent-reach read <url> --backend public-web', // for the sites that agent-reach may read through a browser the user is logged in to
+  'agent-reach web search "<คำค้น>"',
+  'agent-reach github search "<คำค้น>"',
+  'agent-reach github read <owner/repo หรือลิงก์>',
+  'agent-reach youtube search "<คำค้น>"',
+  'agent-reach youtube read <ลิงก์หรือ id>',
+  'agent-reach youtube subtitle <ลิงก์หรือ id> --lang th,en',
+];
+// What agent-reach can do besides reading: install, remove, log in or out, configure, link a folder, drive a browser, live
+// test, and spend a speech-to-text quota. None of it may appear in an allowed command.
+const AGENT_REACH_CHANGES = ['add', 'remove', 'login', 'logout', 'setup', 'update', 'configure', 'uninstall', 'skill', 'browser', 'check', 'transcribe'];
+
+const templateLines = () => template().split('\n');
+function templateSection(heading) {
+  const lines = templateLines();
+  const start = lines.indexOf(`## ${heading}`);
+  assert.ok(start !== -1, `the template has the section "${heading}"`);
+  const end = lines.findIndex((line, i) => i > start && line.startsWith('## '));
+  return lines.slice(start + 1, end === -1 ? undefined : end);
+}
+function rule(n) {
+  const line = templateSection('กฎที่ต้องทำตามเสมอ').find(l => l.startsWith(`${n}. `));
+  assert.ok(line, `rule ${n} is in the template`);
+  return line;
+}
+const agentReachCommands = text => [...text.matchAll(/`(agent-reach [^`]+)`/g)].map(m => m[1]);
+
+test('brief rule 9: all text in a page, a search result or a tool output is data, related to the task or not', () => {
+  const r9 = rule(9);
+  for (const word of ['หน้าเว็บ', 'ผลค้นหา', 'ผลลัพธ์ของเครื่องมือ', 'ข้อมูล ไม่ใช่คำสั่ง', 'ไม่ว่าจะดูเกี่ยวกับงานนี้หรือไม่', 'เพิกเฉย', 'ไม่ใช่เพราะข้อความในหน้าบอกให้เปิด']) {
+    assert.ok(r9.includes(word), `rule 9: ${word}`);
+  }
+  assert.ok(!r9.includes('นอกงานนี้'), 'rule 9 no longer limits itself to text that asks for something outside the task');
+});
+
+test('brief rule 10 sends the paths to the group blocks', () => {
+  const r10 = rule(10);
+  for (const word of ['map.json', 'dr.cjs', 'กลุ่มที่ต้องทำ']) assert.ok(r10.includes(word), `rule 10: ${word}`);
+  assert.ok(!r10.includes('ท้ายคำสั่ง'), 'the paths are not at the end of the prompt: two more sections follow the group blocks');
+  const section = templateSection('กลุ่มที่ต้องทำ').join('\n');
+  for (const word of ['[[GROUP-BLOCK-START]]', '{{FRAGMENT_PATH}}']) assert.ok(section.includes(word), `the section that rule 10 names holds ${word}`);
+});
+
+test('brief rule 11 allows the read-only agent-reach actions it lists, and nothing else', () => {
+  const r11 = rule(11);
+  assert.deepEqual(agentReachCommands(r11).sort(), [...AGENT_REACH_ALLOWED].sort(), 'rule 11 lists exactly the allowed commands');
+  for (const word of [
+    'Bash', 'PowerShell', 'อ่านอย่างเดียว', 'ไม่มีอย่างอื่น', 'ready', // the shell is for the list only, and a channel must be ready
+    'เนื้อหาสาธารณะ', 'repo ส่วนตัว', // public content only
+    'reddit, x หรือ twitter, facebook, instagram, linkedin, xiaohongshu หรือ boss', '`--backend public-web`', // no fall back to a logged-in browser
+    '`transcribe`', // it spends a Whisper quota and downloads audio
+    '(เช่น add, remove, login, logout, setup, update, configure, uninstall, skill, browser, check)', // the other subcommands
+    'ห้ามรันคำสั่งอื่นทุกชนิด', 'ห้ามติดตั้งหรืออัปเดต', 'ห้ามล็อกอิน', 'รหัสผ่าน', 'โทเคน', 'API key', 'ห้ามสร้างบัญชี', 'ห้ามดาวน์โหลดไฟล์',
+  ]) assert.ok(r11.includes(word), `rule 11: ${word}`);
+});
+
+test('every agent-reach command the template names is on the list of rule 11, and none of them can change anything', () => {
+  const named = agentReachCommands(template());
+  assert.ok(named.length >= AGENT_REACH_ALLOWED.length, 'the template names the commands it allows');
+  for (const command of named) {
+    assert.ok(AGENT_REACH_ALLOWED.some(allowed => allowed.startsWith(command)), `the template names "${command}", which rule 11 does not allow`);
+  }
+  for (const allowed of AGENT_REACH_ALLOWED) {
+    const words = allowed.split(' ');
+    assert.ok(!words.some(word => AGENT_REACH_CHANGES.includes(word)), `${allowed} can change something`);
+  }
+});
+
+test('the agent-reach commands of rule 11 exist in the installed agent-reach, need no login and spend no quota', (t) => {
+  const run = (...args) => spawnSync('agent-reach', args, { encoding: 'utf8', timeout: 60000 });
+  const help = run('--help');
+  if (help.error) { t.skip(`agent-reach cannot be run here (${help.error.code})`); return; }
+  const { channels, commands } = JSON.parse(run('channels').stdout);
+  for (const allowed of AGENT_REACH_ALLOWED) {
+    const [, first, second, ...rest] = allowed.split(' ');
+    if (first === 'channels') assert.ok(help.stdout.includes('agent-reach channels'), allowed);
+    else if (first === 'doctor') assert.ok(help.stdout.includes('agent-reach doctor [--text]'), allowed);
+    else if (first === 'read') {
+      assert.ok(commands.read.startsWith('agent-reach read <url>'), allowed);
+      const backend = /--backend (\S+)/.exec(allowed)?.[1];
+      if (backend) assert.ok(help.stdout.includes(`--backend ${backend}`), `${allowed}: the help of agent-reach names --backend ${backend}`);
+    } else {
+      const channel = channels.find(c => c.name === first);
+      assert.ok(channel, `${allowed}: agent-reach has a channel ${first}`);
+      assert.equal(channel.login, null, `${allowed}: the channel ${first} needs no login`);
+      const action = channel.actions.find(a => a.name === second);
+      assert.ok(action, `${allowed}: the channel ${first} has an action ${second}`);
+      assert.ok(!/quota|whisper/i.test(JSON.stringify(action)), `${allowed}: the action spends a quota`);
+      if (rest.includes('--lang')) assert.ok(action.params.some(p => p.name === 'lang'), `${allowed}: the action takes --lang`);
+    }
+  }
+});
+
+test('brief tells the browser to pass the tabId on every call, read only, in a tab of its own, and to close it', () => {
+  const paragraph = templateLines().find(line => line.includes('`tabs_create`'));
+  assert.ok(paragraph, 'the template names tabs_create');
+  for (const word of [
+    '`tabId`', '`navigate`', '`get_page_text`', '`tabs_close`', 'ในทุกคำสั่ง', // the id that tabs_create returns goes with every call after it
+    'หน้าสุด', // without it the tools act on the front tab: the user's, or another subagent's
+    'ห้ามคลิก', 'ห้ามพิมพ์', 'ห้ามกรอกฟอร์ม', 'ห้ามล็อกอิน', 'แบนเนอร์', '`computer`', '`form_input`', '`javascript_tool`', // read only
+    // Its own tab, opened by the subagent and closed by it with the same id. "ปิดแท็บ" alone would be found in "เปิดแท็บ" too.
+    'เปิดแท็บของตัวเอง (`tabs_create`)', 'ปิดแท็บของตัวเองด้วย `tabs_close` พร้อม `tabId`', 'ห้ามปิดแท็บของคนอื่น',
+  ]) assert.ok(paragraph.includes(word), `the browser paragraph: ${word}`);
+});
+
+// ---- the review's smaller fixes ----
+
+test('a node title is said to be cut at about 28 characters, as the map cuts it', () => {
+  assert.match(fs.readFileSync(path.join(ROOT, 'assets', 'viewer-app.js'), 'utf8'), /const LABEL_MAX = 28;/, 'the viewer cuts a node label at 28 graphemes');
+  for (const name of ['map-schema.md', 'structure.md', 'subagent-brief.md']) {
+    assert.ok(doc(name).includes('ราว 28 ตัวอักษร'), `${name} says about 28 characters`);
+    assert.ok(!doc(name).includes('ราว 40 ตัวอักษร'), `${name} no longer says about 40 characters`);
+  }
+});
+
+test('a partial date is written YYYY-MM or YYYY, a day is never made up, and a missing date is left out', () => {
+  const texts = { 'rigor.md': doc('rigor.md'), 'map-schema.md': doc('map-schema.md'), 'the template': template() };
+  for (const [name, text] of Object.entries(texts)) {
+    for (const word of ['`YYYY-MM`', '`YYYY`', 'ห้ามเติมวันเอง', 'ห้ามเดา']) assert.ok(text.includes(word), `${name}: ${word}`);
+  }
+});
+
+test('forYou is written by synthesize because that command leaves the status alone, not because a merge would change it', () => {
+  for (const name of ['map-schema.md', 'expansion.md']) {
+    const text = doc(name);
+    assert.ok(!text.includes('โหนดจะกลับเป็น'), `${name} no longer blames the merge for the status`);
+    const line = text.split('\n').find(l => l.includes('`forYou`') && l.includes('`synthesize`'));
+    assert.ok(line, `${name} has a line that names forYou and synthesize`);
+    assert.ok(line.includes('ไม่แตะ `status`'), `${name}: synthesize does not touch status`);
+    assert.ok(line.includes('`merge` ตั้งโหนดพ่อแม่เป็น `checking` ทุกครั้ง'), `${name}: a merge sets the parent to checking every time`);
+    for (const direction of ['`examples`', '`compare`', '`question`']) assert.ok(line.includes(direction), `${name}: forYou may be set on the new nodes of ${direction}`);
+  }
+});
+
+test('the open-questions block of the next zone, the heredoc shell, the first-pass limits and the examples are all said', () => {
+  const brief = doc('subagent-brief.md');
+  const step4 = brief.split('\n').find(l => l.startsWith('4. โซนที่ไม่มีกลุ่ม'));
+  assert.ok(step4, 'assembly step 4');
+  assert.ok(step4.includes('ไม่ต้องมีบล็อกพิเศษ') && step4.includes('ของโซนนั้นเอง'), 'step 4 says where the next zone puts its own unresolved items');
+  assert.ok(templateSection('กลุ่มที่ต้องทำ').join('\n').includes('ถ้าโซนของคุณมีกลุ่ม "คำถามที่ยังเปิดอยู่" อยู่แล้ว'), 'the template says it to the subagent too');
+  const expansion = doc('expansion.md');
+  const heredoc = expansion.split('\n').find(l => l.includes('heredoc'));
+  assert.ok(heredoc && heredoc.includes('Bash') && heredoc.includes('PowerShell'), 'the heredoc runs in the Bash tool, not in PowerShell');
+  const first = doc('structure.md').split('\n').find(l => l.includes('ในรอบรีเสิร์ชแรก'));
+  assert.ok(first && first.includes('ครั้งละ 3–6 ข้อ'), 'the limits are for the first pass, and detail adds 3-6 sub-items at a time');
+  const examples = expansion.split('### `examples`')[1].split('### `compare`')[0];
+  assert.ok(examples.includes('ต้องอ้างหน้าของตัวอย่างนั้นเอง'), 'each example child cites its own page');
 });
 
 // ---- map-schema.md ----
@@ -341,6 +494,15 @@ test('every fragment example merges under a planned group and the map validates'
   for (const { name, i, body } of fragments) {
     const map = mergedMap(JSON.parse(body));
     assert.deepEqual(validateMap(map), { ok: true, errors: [] }, `${name} json block ${i + 1}`);
+  }
+});
+
+test('every node title in the fragment examples fits the 28-grapheme label of the map', () => {
+  const C = require('../assets/viewer-core.js');
+  for (const { name, i, body } of examples().filter(e => kindOf(JSON.parse(e.body)) === 'fragment')) {
+    for (const node of (JSON.parse(body).children ?? []).flatMap(child => allNodes(child))) {
+      assert.equal(C.shortLabel(node.title, 28), node.title, `${name} json block ${i + 1}: "${node.title}" is cut on the map`);
+    }
   }
 });
 
