@@ -3,11 +3,16 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { spawn } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
+const { inspect } = require('node:util');
 const { appendRequest, readRequests, watchInbox } = require('../scripts/lib/inbox.cjs');
 
 // Almost every Thai character is 3 bytes in UTF-8, so a byte offset and a character offset are far apart.
 const THAI = 'ราคาเท่าไร ใช้เวลานานแค่ไหน';
+// idleMs has to be above 0, and this is as close to 0 as a number gets: the idle window has run out as soon as it starts.
+const NO_WAIT = Number.MIN_VALUE;
+// The module as a source text a script can require.
+const INBOX_MODULE = JSON.stringify(path.join(__dirname, '..', 'scripts', 'lib', 'inbox.cjs'));
 
 function tmpDir(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dr-inbox-'));
@@ -107,12 +112,23 @@ test('every id is r-<time>-<4 base-36 characters>, and all 4 are random', t => {
 test('appendRequest rejects a request without nodeId, direction or a text question, and writes nothing', t => {
   const dir = tmpDir(t);
   const bad = [
-    undefined, {}, { nodeId: 'g-know-1' }, { direction: 'detail' },
+    {}, { nodeId: 'g-know-1' }, { direction: 'detail' },
     { nodeId: '', direction: 'detail' }, { nodeId: 'g-know-1', direction: '' },
     { nodeId: 7, direction: 'detail' }, { nodeId: 'g-know-1', direction: ['detail'] },
     { nodeId: 'g-know-1', direction: 'question', question: 5 },
   ];
   for (const req of bad) assert.throws(() => appendRequest(dir, req), /nodeId|direction|question/, JSON.stringify(req));
+  assert.equal(fs.existsSync(inboxFile(dir)), false);
+});
+
+test('appendRequest called with something that is not an object throws its own validation error', t => {
+  const dir = tmpDir(t);
+  // The module's own Error and message, not the TypeError that destructuring null or undefined would raise.
+  const isOwnError = err => err.constructor === Error && /request must be an object/.test(err.message);
+  for (const bad of [null, undefined, 'detail', 42, true, [], ['g-know-1', 'detail'], () => {}]) {
+    assert.throws(() => appendRequest(dir, bad), isOwnError, inspect(bad));
+  }
+  assert.throws(() => appendRequest(dir), isOwnError, 'no second argument at all');
   assert.equal(fs.existsSync(inboxFile(dir)), false);
 });
 
@@ -140,7 +156,7 @@ test('requests appended by several processes at once never run into each other',
   const writers = 3;
   const each = 60;
   const script = `
-    const { appendRequest } = require(${JSON.stringify(path.join(__dirname, '..', 'scripts', 'lib', 'inbox.cjs'))});
+    const { appendRequest } = require(${INBOX_MODULE});
     for (let i = 0; i < ${each}; i++) {
       const question = process.argv[1] + ' #' + i + ' ' + ${JSON.stringify(THAI)} + ' ' + 'ก'.repeat(i * 5);
       appendRequest(${JSON.stringify(dir)}, { nodeId: 'g-know-1', direction: 'question', question });
@@ -254,12 +270,32 @@ test('readRequests from an offset returns only the requests after it', t => {
   assert.deepEqual(readRequests(dir, afterB), { requests: [c], offset: sizeOf(dir) });
 });
 
-test('an offset at or past the end of the file reads nothing and comes back unchanged', t => {
+test('an offset at the end of the file reads nothing and comes back unchanged', t => {
   const dir = tmpDir(t);
   appendRequest(dir, { nodeId: 'g-know-1', direction: 'detail' });
   const end = sizeOf(dir);
   assert.deepEqual(readRequests(dir, end), { requests: [], offset: end });
-  assert.deepEqual(readRequests(dir, end + 100), { requests: [], offset: end + 100 });
+});
+
+test('an offset past the end of the file means it was truncated or replaced, so reading restarts at byte 0', t => {
+  const dir = tmpDir(t);
+  const a = appendRequest(dir, { nodeId: 'g-know-1', direction: 'detail' });
+  const b = appendRequest(dir, { nodeId: 'g-know-2', direction: 'detail' });
+  const restarted = readRequests(dir, 10000);
+  assert.deepEqual(restarted, { requests: [a, b], offset: sizeOf(dir) });
+  // The offset it returns belongs to the file as it is now: reading on from it gives only what comes next.
+  const c = appendRequest(dir, { nodeId: 'g-know-3', direction: 'detail' });
+  assert.deepEqual(readRequests(dir, restarted.offset), { requests: [c], offset: sizeOf(dir) });
+  // A shorter file with new content in its place is read from its start too.
+  const stale = sizeOf(dir);
+  fs.writeFileSync(inboxFile(dir), `${requestLine('g-warn-1')}\n`);
+  assert.deepEqual(readRequests(dir, stale).requests.map(x => x.nodeId), ['g-warn-1']);
+  // A file emptied out: the offset follows it back to 0, so what is written next is read.
+  const emptied = sizeOf(dir);
+  fs.writeFileSync(inboxFile(dir), '');
+  assert.deepEqual(readRequests(dir, emptied), { requests: [], offset: 0 });
+  const d = appendRequest(dir, { nodeId: 'g-warn-2', direction: 'detail' });
+  assert.deepEqual(readRequests(dir, 0), { requests: [d], offset: sizeOf(dir) });
 });
 
 test('blank, malformed and non-object lines are skipped but still consumed', t => {
@@ -269,6 +305,49 @@ test('blank, malformed and non-object lines are skipped but still consumed', t =
   const r = readRequests(dir);
   assert.deepEqual(r.requests.map(x => x.nodeId), ['g-know-1', 'g-know-2']);
   assert.equal(r.offset, sizeOf(dir), 'a bad line must not hold the offset back, or it would block every line after it');
+});
+
+test('lines that parse to an object but are not requests are skipped, and still consumed', t => {
+  const dir = tmpDir(t);
+  const lines = [requestLine('g-know-1'), '{}', '{"a":1}', '{"nodeId":5,"direction":[]}', requestLine('g-know-2')];
+  fs.writeFileSync(inboxFile(dir), `${lines.join('\n')}\n`);
+  const r = readRequests(dir);
+  assert.deepEqual(r.requests.map(x => x.nodeId), ['g-know-1', 'g-know-2']);
+  assert.equal(r.offset, sizeOf(dir), 'an object that is not a request must not hold the offset back either');
+});
+
+test('appendRequest and readRequests share one rule for what a request is', t => {
+  // nodeId and direction are non-empty strings, and question is absent, null or a string. Each shape goes in through
+  // both functions: appendRequest must refuse exactly what readRequests would skip.
+  const shapes = [
+    [{ nodeId: 'g-know-1', direction: 'detail' }, true],
+    [{ nodeId: 'g-know-1', direction: 'detail', question: null }, true],
+    [{ nodeId: 'g-know-1', direction: 'question', question: THAI }, true],
+    [{ nodeId: 'g-know-1', direction: 'question', question: '' }, true],
+    [{ nodeId: 'g-know-1', direction: 'detail', other: 1 }, true],
+    [{}, false],
+    [{ a: 1 }, false],
+    [{ nodeId: 'g-know-1' }, false],
+    [{ direction: 'detail' }, false],
+    [{ nodeId: '', direction: 'detail' }, false],
+    [{ nodeId: 'g-know-1', direction: '' }, false],
+    [{ nodeId: 5, direction: [] }, false],
+    [{ nodeId: 5, direction: 'detail' }, false],
+    [{ nodeId: 'g-know-1', direction: ['detail'] }, false],
+    [{ nodeId: 'g-know-1', direction: 'detail', question: 5 }, false],
+    [{ nodeId: 'g-know-1', direction: 'detail', question: {} }, false],
+  ];
+  const readDir = tmpDir(t);
+  const appendDir = tmpDir(t);
+  for (const [shape, isRequest] of shapes) {
+    fs.writeFileSync(inboxFile(readDir), `${JSON.stringify(shape)}\n`);
+    const read = readRequests(readDir);
+    assert.equal(read.requests.length, isRequest ? 1 : 0, `readRequests and ${inspect(shape)}`);
+    assert.equal(read.offset, sizeOf(readDir), `the line is passed over either way: ${inspect(shape)}`);
+    let appended = true;
+    try { appendRequest(appendDir, shape); } catch { appended = false; }
+    assert.equal(appended, isRequest, `appendRequest and ${inspect(shape)}`);
+  }
 });
 
 test('CRLF line endings and a leading BOM are tolerated', t => {
@@ -320,6 +399,10 @@ test('every file that appendRequest or readRequests opens is closed again, even 
   t.mock.method(fs, 'readSync', () => { throw new Error('disk error'); });
   assert.throws(() => readRequests(dir), /disk error/);
   assert.throws(() => appendRequest(dir, { nodeId: 'g-know-3', direction: 'detail' }), /disk error/);
+  // A folder where the inbox file belongs is refused once it has been opened, and has to be closed all the same.
+  const odd = tmpDir(t);
+  fs.mkdirSync(inboxFile(odd));
+  assert.throws(() => readRequests(odd), /not a regular file/);
   assert.equal(open.size, 0, 'after calls that fail');
 });
 
@@ -355,6 +438,16 @@ test('watchInbox reports the requests already in the file, from the offset it is
   assert.deepEqual(await reported({ offset: afterA }), [b.id, c.id]);
   assert.deepEqual(await reported({ offset: sizeOf(dir) }), []);
   assert.deepEqual(await reported({}), [a.id, b.id, c.id]);
+});
+
+test('watchInbox started with an offset past the end of the file reads the file from the beginning', async t => {
+  const dir = tmpDir(t);
+  const a = appendRequest(dir, { nodeId: 'g-know-1', direction: 'detail' });
+  const reported = within(new Promise(resolve => {
+    const ids = [];
+    startWatch(t, dir, { offset: 100_000, pollMs: 20, idleMs: 60, onRequest: r => ids.push(r.id), onIdle: () => resolve(ids) });
+  }), 5000, 'the watch to go idle');
+  assert.deepEqual(await reported, [a.id]);
 });
 
 test('watchInbox keeps polling an inbox that does not exist yet and reports once the file appears', async t => {
@@ -509,7 +602,7 @@ test('onIdle is optional', async t => {
   const dir = tmpDir(t);
   appendRequest(dir, { nodeId: 'g-know-1', direction: 'detail' });
   const seen = [];
-  startWatch(t, dir, { offset: 0, pollMs: 20, idleMs: 0, onRequest: r => seen.push(r.nodeId) });
+  startWatch(t, dir, { offset: 0, pollMs: 20, idleMs: NO_WAIT, onRequest: r => seen.push(r.nodeId) });
   await waitFor(() => seen.length === 1, 'the request');
   await sleep(50); // idle is declared in the same poll as the request, and would have thrown on a missing onIdle by now
   assert.deepEqual(seen, ['g-know-1']);
@@ -519,8 +612,8 @@ test('stop() ends the watch before it reports anything, idle included', async t 
   const dir = tmpDir(t);
   appendRequest(dir, { nodeId: 'g-know-1', direction: 'detail' }); // already waiting in the file
   const calls = [];
-  // idleMs 0 would report the request and go idle at once if this watch were not stopped.
-  const watch = watchInbox(dir, { offset: 0, pollMs: 20, idleMs: 0, onRequest: () => calls.push('request'), onIdle: () => calls.push('idle') });
+  // An idle window of NO_WAIT would report the request and go idle at once if this watch were not stopped.
+  const watch = watchInbox(dir, { offset: 0, pollMs: 20, idleMs: NO_WAIT, onRequest: () => calls.push('request'), onIdle: () => calls.push('idle') });
   watch.stop();
   watch.stop(); // stopping twice is fine
   await sleep(150);
@@ -532,9 +625,9 @@ test('stop() inside onRequest drops the rest of that batch and never reports idl
     const dir = tmpDir(t);
     for (let i = 1; i <= waiting; i++) appendRequest(dir, { nodeId: `g-know-${i}`, direction: 'detail' });
     const calls = [];
-    // idleMs 0 would declare idle right after the batch if stop() did not hold.
+    // An idle window of NO_WAIT would declare idle right after the batch if stop() did not hold.
     const watch = startWatch(t, dir, {
-      offset: 0, pollMs: 20, idleMs: 0,
+      offset: 0, pollMs: 20, idleMs: NO_WAIT,
       onRequest: r => { calls.push(r.nodeId); watch.stop(); },
       onIdle: () => calls.push('idle'),
     });
@@ -543,21 +636,101 @@ test('stop() inside onRequest drops the rest of that batch and never reports idl
   }
 });
 
-test('watchInbox rejects options it cannot honor', t => {
+test('watchInbox rejects a missing or non-function callback and a bad offset', t => {
   const dir = tmpDir(t);
   const ok = { offset: 0, pollMs: 20, idleMs: 100, onRequest() {} };
   const started = [];
   t.after(() => started.forEach(watch => watch.stop())); // a watch that should have been refused must not outlive the test
+  const bad = [{ onRequest: undefined }, { onRequest: 'go' }, { onIdle: 'done' }, { offset: -1 }, { offset: 1.5 }, { offset: '0' }, { offset: null }];
+  for (const options of bad) {
+    assert.throws(() => started.push(watchInbox(dir, { ...ok, ...options })), /onRequest|onIdle|offset/, inspect(options));
+  }
+});
+
+test('watchInbox throws a RangeError, before it starts any timer, for a pollMs or idleMs it cannot honor', t => {
+  const dir = tmpDir(t);
+  const advance = fakeTime(t);
+  const polls = countPolls(t, dir);
+  const ok = { offset: 0, pollMs: 20, idleMs: 100, onRequest() {} };
+  const started = [];
+  t.after(() => started.forEach(watch => watch.stop()));
+  // pollMs has to be a number from 1 to 2**31 - 1: setTimeout turns a delay outside that into 1 ms, a busy loop.
+  // idleMs has to be a number above 0 (Infinity: never idle).
   const bad = [
-    { onRequest: undefined }, { onRequest: 'go' }, { onIdle: 'done' },
-    { pollMs: 0 }, { pollMs: -5 }, { pollMs: NaN }, { pollMs: Infinity }, { pollMs: '20' },
-    { idleMs: -1 }, { idleMs: NaN }, { idleMs: '100' },
-    { offset: -1 }, { offset: 1.5 }, { offset: '0' }, { offset: null },
+    { pollMs: 0 }, { pollMs: -1 }, { pollMs: NaN }, { pollMs: 2 ** 31 }, { pollMs: '5' }, { pollMs: 0.5 }, { pollMs: Infinity },
+    { idleMs: 0 }, { idleMs: -5 }, { idleMs: NaN }, { idleMs: '100' },
   ];
   for (const options of bad) {
-    assert.throws(() => started.push(watchInbox(dir, { ...ok, ...options })), /onRequest|onIdle|pollMs|idleMs|offset/, JSON.stringify(options));
+    assert.throws(() => started.push(watchInbox(dir, { ...ok, ...options })),
+      err => err instanceof RangeError && /pollMs|idleMs/.test(err.message), inspect(options));
   }
-  // The edges that are fine: an idle window that never ends, and a watch with every default.
-  started.push(watchInbox(dir, { ...ok, idleMs: Infinity }), watchInbox(dir, { onRequest() {} }));
-  assert.ok(started.every(watch => typeof watch.stop === 'function'));
+  advance(60_000); // a timer started by any of those calls would poll now
+  assert.equal(polls.count, 0, 'no poll ran, so no call started a timer');
+  assert.equal(started.length, 0);
+  // The edges that are fine, and a watch with every default.
+  for (const options of [{ pollMs: 1 }, { pollMs: 2 ** 31 - 1 }, { idleMs: Infinity }, { idleMs: NO_WAIT }]) {
+    started.push(watchInbox(dir, { ...ok, ...options }));
+  }
+  started.push(watchInbox(dir, { onRequest() {} }));
+  assert.equal(started.length, 5);
+});
+
+test('an idleMs of Infinity never goes idle, however long the watch runs', t => {
+  const dir = tmpDir(t);
+  const advance = fakeTime(t);
+  const polls = countPolls(t, dir);
+  let idle = 0;
+  const longest = 2 ** 31 - 1; // the longest pollMs there is: about 25 days
+  startWatch(t, dir, { offset: 0, pollMs: longest, idleMs: Infinity, onRequest() {}, onIdle: () => { idle += 1; } });
+  advance(0);
+  for (let i = 0; i < 3; i++) advance(longest);
+  assert.equal(polls.count, 4, 'it keeps polling, a poll every pollMs');
+  assert.equal(idle, 0);
+});
+
+// ---- failing loudly ----
+// dr.cjs watch relies on these: a watch that hits a failure must end the process, not carry on and report idle. The
+// two watch cases run in a process of their own, so what is tested is the real crash and not node:test's handling of one.
+
+function runChild(t, source) {
+  const script = path.join(tmpDir(t), 'child.cjs');
+  fs.writeFileSync(script, source);
+  return spawnSync(process.execPath, [script], { encoding: 'utf8', timeout: 20_000, killSignal: 'SIGKILL' });
+}
+// A script that watches dir and prints IDLE-MARKER if it ever goes idle. idleMs is long enough for a watch that
+// ignored the failure to get there, so the marker's absence means something.
+const watchScript = (dir, onRequest) => `
+  const { watchInbox } = require(${INBOX_MODULE});
+  watchInbox(${JSON.stringify(dir)}, {
+    offset: 0, pollMs: 20, idleMs: 300,
+    onRequest: ${onRequest},
+    onIdle() { console.log('IDLE-MARKER'); },
+  });`;
+
+test('an onRequest that throws ends the process with that error, and no idle line', t => {
+  const dir = tmpDir(t);
+  appendRequest(dir, { nodeId: 'g-know-1', direction: 'detail' });
+  const child = runChild(t, watchScript(dir, "() => { throw new Error('boom from onRequest'); }"));
+  assert.equal(child.error, undefined, 'the process ended by itself');
+  assert.ok(child.status > 0, `exit status ${child.status}`);
+  assert.match(child.stderr, /boom from onRequest/);
+  assert.doesNotMatch(child.stdout, /IDLE-MARKER/);
+});
+
+test('a read error during a poll ends the process with that error, and no idle line', t => {
+  const dir = tmpDir(t);
+  fs.mkdirSync(inboxFile(dir)); // a folder where the inbox file belongs: not a missing file, and not an empty inbox either
+  const child = runChild(t, watchScript(dir, '() => {}'));
+  assert.equal(child.error, undefined, 'the process ended by itself');
+  assert.ok(child.status > 0, `exit status ${child.status}`);
+  assert.match(child.stderr, /not a regular file/);
+  assert.doesNotMatch(child.stdout, /IDLE-MARKER/);
+});
+
+test('appendRequest into a folder that does not exist throws ENOENT and creates nothing', t => {
+  const parent = tmpDir(t);
+  const missing = path.join(parent, 'no-such-topic');
+  assert.throws(() => appendRequest(missing, { nodeId: 'g-know-1', direction: 'detail' }), { code: 'ENOENT' });
+  assert.equal(fs.existsSync(missing), false);
+  assert.deepEqual(fs.readdirSync(parent), []);
 });
