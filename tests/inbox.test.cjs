@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { spawn } = require('node:child_process');
 const { appendRequest, readRequests, watchInbox } = require('../scripts/lib/inbox.cjs');
 
 // Almost every Thai character is 3 bytes in UTF-8, so a byte offset and a character offset are far apart.
@@ -124,12 +125,42 @@ test('appendRequest accepts a null question and leaves it out', t => {
 
 test('a question with line breaks and U+2028 stays on one line and reads back unchanged', t => {
   const dir = tmpDir(t);
-  const question = 'บรรทัดแรก\nบรรทัดสอง\r\nสาม สี่ ห้า "quoted" \\ back </script><!--';
+  // U+2028 and U+2029 are line separators to some tools, but the lines of this file end only at the newline character.
+  const separators = String.fromCharCode(0x2028, 0x2029);
+  const question = `บรรทัดแรก\nบรรทัดสอง\r\nสาม${separators}สี่ "quoted" \\ back </script><!--`;
   const req = appendRequest(dir, { nodeId: 'g-know-1', direction: 'question', question });
   assert.equal(fs.readFileSync(inboxFile(dir), 'utf8').split('\n').length, 2, 'one line, then the empty piece after its newline');
   const r = readRequests(dir);
   assert.deepEqual(r.requests, [req]);
   assert.equal(r.requests[0].question, question);
+});
+
+test('requests appended by several processes at once never run into each other', async t => {
+  const dir = tmpDir(t);
+  const writers = 3;
+  const each = 60;
+  const script = `
+    const { appendRequest } = require(${JSON.stringify(path.join(__dirname, '..', 'scripts', 'lib', 'inbox.cjs'))});
+    for (let i = 0; i < ${each}; i++) {
+      const question = process.argv[1] + ' #' + i + ' ' + ${JSON.stringify(THAI)} + ' ' + 'ก'.repeat(i * 5);
+      appendRequest(${JSON.stringify(dir)}, { nodeId: 'g-know-1', direction: 'question', question });
+    }`;
+  await Promise.all(Array.from({ length: writers }, (_, w) => new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['-e', script, `w${w}`], { stdio: 'inherit' });
+    child.on('error', reject);
+    child.on('exit', code => (code === 0 ? resolve() : reject(new Error(`writer ${w} exited with ${code}`))));
+  })));
+  // Every physical line is a whole request: none was run into its neighbour and skipped as malformed.
+  const lines = fs.readFileSync(inboxFile(dir), 'utf8').split('\n').filter(line => line !== '');
+  assert.equal(lines.length, writers * each);
+  assert.ok(lines.every(line => typeof JSON.parse(line).question === 'string'));
+  const r = readRequests(dir);
+  assert.equal(r.requests.length, writers * each);
+  assert.equal(r.offset, sizeOf(dir));
+  for (let w = 0; w < writers; w++) {
+    const mine = r.requests.map(req => /^(w\d+) #(\d+) /.exec(req.question)).filter(m => m[1] === `w${w}`).map(m => Number(m[2]));
+    assert.deepEqual(mine, Array.from({ length: each }, (_, i) => i), `writer ${w}: every request, in the order it was written`);
+  }
 });
 
 test('appendRequest starts a new line when the file ends in an unterminated one', t => {
@@ -242,7 +273,9 @@ test('blank, malformed and non-object lines are skipped but still consumed', t =
 
 test('CRLF line endings and a leading BOM are tolerated', t => {
   const dir = tmpDir(t);
-  fs.writeFileSync(inboxFile(dir), `﻿${requestLine('g-know-1')}\r\n\r\n${requestLine('g-know-2')}\r\n`);
+  const bom = Buffer.from([0xef, 0xbb, 0xbf]); // the UTF-8 byte order mark that some Windows editors put at the start of a file
+  const body = Buffer.from(`${requestLine('g-know-1')}\r\n\r\n${requestLine('g-know-2')}\r\n`);
+  fs.writeFileSync(inboxFile(dir), Buffer.concat([bom, body]));
   const r = readRequests(dir);
   assert.deepEqual(r.requests.map(x => x.nodeId), ['g-know-1', 'g-know-2']);
   assert.equal(r.offset, sizeOf(dir));
@@ -351,13 +384,49 @@ test('watchInbox also waits for a topic folder that does not exist yet', async t
   assert.deepEqual(seen, ['g-warn-1']);
 });
 
-test('watchInbox polls at the pollMs it is given, however small', async t => {
+// The next three tests drive the watch's timers and its clock by hand, so they measure intervals exactly and wait for
+// nothing. advance(ms) moves the fake clock and the fake timers forward together.
+function fakeTime(t) {
+  let now = 1000;
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  t.mock.method(performance, 'now', () => now);
+  return ms => { now += ms; t.mock.timers.tick(ms); };
+}
+
+// Whatever pollMs is given is the interval, with no floor under it: 20 ms is as good as 4 s. With none given, it is a second.
+for (const [name, options, every] of [
+  ['20 ms', { pollMs: 20 }, 20], ['37 ms', { pollMs: 37 }, 37], ['250 ms', { pollMs: 250 }, 250],
+  ['4 s', { pollMs: 4000 }, 4000], ['second when pollMs is not given', {}, 1000],
+]) {
+  test(`watchInbox polls every ${name}`, t => {
+    const dir = tmpDir(t);
+    const advance = fakeTime(t);
+    const polls = countPolls(t, dir);
+    startWatch(t, dir, { offset: 0, idleMs: 3_600_000, onRequest() {}, ...options });
+    advance(0);
+    assert.equal(polls.count, 1, 'the first poll comes at once');
+    for (let n = 2; n <= 4; n++) {
+      advance(every - 1);
+      assert.equal(polls.count, n - 1, `poll ${n} does not come before ${every} ms have passed`);
+      advance(1);
+      assert.equal(polls.count, n, `poll ${n} comes ${every} ms after the one before`);
+    }
+  });
+}
+
+test('watchInbox goes idle after 30 minutes without a request when idleMs is not given', t => {
   const dir = tmpDir(t);
-  const polls = countPolls(t, dir);
-  startWatch(t, dir, { offset: 0, pollMs: 20, idleMs: 60_000, onRequest() {} });
-  // 25 polls in 4 s needs an interval under 160 ms, so a floor or a default of 250 or 1000 ms cannot do it. At the
-  // 20 ms asked for it takes under a second (timers on Windows tick about every 15 ms, so 20 ms comes out near 30).
-  await waitFor(() => polls.count >= 25, '25 polls', 4000);
+  const advance = fakeTime(t);
+  let idle = 0;
+  // A 10 minute pollMs keeps this to a few steps: the poll nearest the deadline is brought forward to land on it.
+  startWatch(t, dir, { offset: 0, pollMs: 600_000, onRequest() {}, onIdle: () => { idle += 1; } });
+  advance(0);
+  advance(600_000);
+  advance(600_000);
+  advance(599_999);
+  assert.equal(idle, 0, 'not a millisecond before 30 minutes');
+  advance(1);
+  assert.equal(idle, 1, 'at 30 minutes');
 });
 
 test('the idle window restarts with each request, and a request is read before idle is declared', async t => {
