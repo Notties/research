@@ -106,9 +106,10 @@
   /**
    * The key two expansion requests are compared by: node, direction and question. A missing, null and empty question are
    * the same question, and the id, the time and the status are not part of the key. This is the rule of queueKey in
-   * scripts/lib/map.cjs, which the live server and the command-line tool dedupe by. The browser cannot require that file
-   * (it reads files), so the rule is repeated here and a test keeps the two equal. queueCounts compares a cleaned form
-   * of it (cleanKey), so this function stays the same as the one in map.cjs.
+   * scripts/lib/map.cjs, which acceptRequests (and so the command-line tool) dedupes by. The browser cannot require that
+   * file (it reads files), so the rule is repeated here and a test keeps the two equal. The live server, queueCounts and
+   * the viewer's offline queue dedupe by a cleaned form of it (cleanKey), so this function stays the same as the one in
+   * map.cjs.
    */
   const queueKey = r => JSON.stringify([r.nodeId, r.direction, r.question ?? '']);
 

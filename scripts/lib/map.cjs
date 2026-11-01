@@ -257,8 +257,9 @@ function markChecked(map) {
 /**
  * The key two queue requests are compared by: node, direction and question. Requests with the same key ask for the
  * same research, so only one of them is queued. A missing, null and empty question are the same question. The id, the
- * time and the status are not part of the key, so a request and the queue item made from it share one. The live server
- * imports this, so it and acceptRequests dedupe by one rule.
+ * time and the status are not part of the key, so a request and the queue item made from it share one. acceptRequests
+ * dedupes by this key. The live server dedupes by DRCore.cleanKey (assets/viewer-core.js), which is this key with the
+ * question cleaned first.
  * @param {{ nodeId: string, direction: string, question?: string | null }} request
  * @returns {string}
  */

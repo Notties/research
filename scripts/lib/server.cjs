@@ -20,7 +20,8 @@
 // The server answers only requests that look like they came from the page itself. Any website open in the same browser can
 // send a request to a loopback port, and a rebinding domain can point its own name at it, so a Host that is not this server
 // and an Origin that is not this server are both refused (403) for every request, and POST /expand takes application/json
-// only (415), which a web page cannot send to another site without asking first. A body is at most 16 KiB (413).
+// only (415), which a web page cannot send to another site without asking first. A body is at most 16 KiB (413). The page is
+// sent with headers that forbid framing by any other site, so it cannot be covered up to trick a click (see NO_FRAMING).
 const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
@@ -40,6 +41,9 @@ const DIRECTION_IDS = S.DIRECTIONS.map(d => d.id);
 // The addresses startServer may bind to, each with the name that stands for it in a Host header and in a URL. The server
 // answers to all three names, whichever it is bound to, since a browser that is sent to "localhost" says so in its Host.
 const LOOPBACK = { '127.0.0.1': '127.0.0.1', localhost: 'localhost', '::1': '[::1]' };
+// Sent with the page. No other site may put it in a frame: from there it could lay something over the buttons and get a click on
+// a direction out of the reader. The two headers say the same thing, the second for browsers that do not know the first.
+const NO_FRAMING = { 'Content-Security-Policy': "frame-ancestors 'self'", 'X-Frame-Options': 'SAMEORIGIN' };
 
 const TEXT = {
   badHost: 'เซิร์ฟเวอร์นี้รับคำขอจากเครื่องนี้เท่านั้น',
@@ -139,6 +143,10 @@ function checkOptions({ dir, host, port, idleMs, pingMs }) {
   }
   // Not just any value listen takes: a string that is not a number would make it listen on a pipe or a socket file instead.
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new RangeError('port must be a whole number from 0 to 65535');
+  if (port === 80) {
+    // A browser leaves the default port out of Host and Origin, and the checks need it there: every request would be refused.
+    throw new RangeError('port 80 is not supported: browsers leave the default port out of the Host header, and this server needs to see it');
+  }
   if (idleMs !== Infinity && !isDelay(idleMs)) {
     throw new RangeError(`idleMs must be a number of milliseconds from 1 to ${MAX_TIMER_MS}, or Infinity for never`);
   }
@@ -152,7 +160,7 @@ function checkOptions({ dir, host, port, idleMs, pingMs }) {
  * @param {object} options
  * @param {string} options.dir
  * @param {string} [options.host='127.0.0.1'] 127.0.0.1, localhost or ::1: the server listens on the loopback interface only
- * @param {number} [options.port=0] 0 lets the system choose one
+ * @param {number} [options.port=0] 0 lets the system choose one. Not 80: browsers leave that port out of Host and Origin.
  * @param {number} [options.idleMs=1800000] the server stops itself after this many milliseconds with no POST /expand (that
  *   passes the Host and Origin checks). Infinity never stops it.
  * @param {number} [options.pingMs=15000] how often an open stream is sent a ping comment. A test shortens it.
@@ -208,7 +216,7 @@ async function startServer({ dir, host = '127.0.0.1', port = 0, idleMs = IDLE_MS
 
   // ---- the routes ----
 
-  const page = (req, res) => send(res, 200, 'text/html; charset=utf-8', renderIndexHtml(current.map, { live: true }));
+  const page = (req, res) => send(res, 200, 'text/html; charset=utf-8', renderIndexHtml(current.map, { live: true }), NO_FRAMING);
   const mapJson = (req, res) => send(res, 200, 'application/json; charset=utf-8', current.json);
   const favicon = (req, res) => {
     res.writeHead(204);
@@ -301,6 +309,10 @@ async function startServer({ dir, host = '127.0.0.1', port = 0, idleMs = IDLE_MS
       resolve();
     });
   });
+  // From here on the only 'error' the server emits is a failed accept (EMFILE: too many open files, say). With nothing listening it
+  // is thrown out of the event loop and ends the process, and the page goes offline; this way one connection is lost and the rest
+  // are served.
+  server.on('error', err => process.stderr.write(`live server: ${err.code ?? err.name}: ${err.message}\n`));
   const bound = server.address().port;
   for (const name of Object.values(LOOPBACK)) {
     hosts.add(`${name}:${bound}`);

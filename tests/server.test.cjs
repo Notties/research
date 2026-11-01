@@ -121,6 +121,28 @@ function raw(port, text) {
     socket.on('error', reject);
   });
 }
+// A raw answer, cut into the same shape send() gives: { status, headers, text, json() }.
+function parseResponse(answer) {
+  const split = answer.indexOf(CRLF + CRLF);
+  const [statusLine, ...headerLines] = answer.slice(0, split).split(CRLF);
+  const headers = Object.fromEntries(headerLines.map(line => [line.slice(0, line.indexOf(':')).toLowerCase(), line.slice(line.indexOf(':') + 1).trim()]));
+  const text = answer.slice(split + CRLF.length * 2);
+  return { status: Number(statusLine.split(' ')[1]), headers, text, json: () => JSON.parse(text) };
+}
+// A POST whose body goes out in the chunks given and has no Content-Length. It is written by hand: node's own client adds a
+// Content-Length to a body it is given whole, and then the limit on a body that has none would never be tried.
+async function postChunked(port, pieces) {
+  const head = ['POST /expand HTTP/1.1', `Host: 127.0.0.1:${port}`, 'Content-Type: application/json', 'Transfer-Encoding: chunked', 'Connection: close', '', ''].join(CRLF);
+  const chunks = pieces.map(piece => `${Buffer.byteLength(piece).toString(16)}${CRLF}${piece}${CRLF}`).join('');
+  return parseResponse(await raw(port, `${head}${chunks}0${CRLF}${CRLF}`));
+}
+// The text of a POST /expand body of exactly this many bytes: a question padded with ASCII.
+function questionBody(bytes) {
+  const empty = Buffer.byteLength(JSON.stringify({ nodeId: 'g-know-1', direction: 'question', question: '' }));
+  const body = JSON.stringify({ nodeId: 'g-know-1', direction: 'question', question: 'x'.repeat(bytes - empty) });
+  assert.equal(Buffer.byteLength(body), bytes);
+  return body;
+}
 // Resolves when a connection to host:port is made, rejects when it is refused or does not come within `ms`.
 function connects(host, port, ms = 1500) {
   return new Promise((resolve, reject) => {
@@ -294,6 +316,7 @@ test('startServer rejects options it cannot honour', async t => {
     [{ dir, port: 1.5 }, RangeError, /port/],
     [{ dir, port: 'abc' }, RangeError, /port/], // listen would take that for the name of a pipe or a socket file
     [{ dir, port: null }, RangeError, /port/],
+    [{ dir, port: 80 }, RangeError, /port 80/], // a browser leaves the default port out of Host and Origin, so every request would be 403
     [{ dir, idleMs: 0 }, RangeError, /idleMs/],
     [{ dir, idleMs: -1 }, RangeError, /idleMs/],
     [{ dir, idleMs: Number.NaN }, RangeError, /idleMs/],
@@ -311,6 +334,32 @@ test('startServer rejects options it cannot honour', async t => {
   const never = await start(t, dir, { idleMs: Infinity, host: 'localhost' });
   assert.equal(new URL(never.url).hostname, 'localhost');
   assert.equal((await fetch(`${never.url}/map.json`)).status, 200);
+});
+
+test('an error from the listening socket is written to stderr, and the server carries on', async t => {
+  // net.Server emits "error" when it fails to accept a connection (EMFILE: too many open files). Nothing listening for it
+  // makes that a thrown error, which ends the process and leaves the page offline.
+  const { dir } = seeded(t);
+  const createServer = http.createServer;
+  let inner;
+  const spy = t.mock.method(http, 'createServer', (...args) => { inner = createServer(...args); return inner; });
+  const { url } = await start(t, dir);
+  spy.mock.restore();
+  assert.ok(inner, 'startServer did not create its server with http.createServer');
+
+  const written = t.mock.method(process.stderr, 'write', () => true);
+  let thrown = null;
+  try {
+    inner.emit('error', Object.assign(new Error('too many open files'), { code: 'EMFILE' }));
+  } catch (err) {
+    thrown = err;
+  }
+  written.mock.restore();
+  assert.equal(thrown, null, 'the error event was thrown');
+  assert.equal(written.mock.callCount(), 1);
+  assert.match(String(written.mock.calls[0].arguments[0]), /^.*EMFILE.*too many open files.*\n$/); // one line, with the code and the message
+  assert.equal((await fetch(`${url}/map.json`)).status, 200); // and the server still answers
+  assert.equal((await post(url, DETAIL)).status, 202);
 });
 
 test('close() ends the streams, frees the port, clears its timers and resolves closed', async t => {
@@ -349,13 +398,15 @@ test('close() does not wait for a request that is still being sent', async t => 
 
 test('the server stops itself after idleMs with no POST /expand', async t => {
   const { dir } = seeded(t);
+  const idleMs = 1000; // long enough that starting a server and opening a stream cannot use it up, even on a slow machine
   const before = liveTimers();
-  const server = await start(t, dir, { idleMs: 200 });
+  const startedAt = performance.now(); // taken before start(): the idle timer is armed after this, so it cannot run out sooner
+  const server = await start(t, dir, { idleMs });
   const stream = openEvents(t, server.url);
   await opened(stream);
-  const startedAt = performance.now();
   assert.equal(await server.closed, 'idle');
-  assert.ok(performance.now() - startedAt >= 100, 'it did not wait for idleMs');
+  const waited = performance.now() - startedAt;
+  assert.ok(waited >= idleMs - 20, `it stopped after ${Math.round(waited)} ms, not idleMs (a timer may run a millisecond or two early)`);
   await waitFor(() => stream.ended, 'the stream to end', 2000);
   await assert.rejects(connects('127.0.0.1', server.port)); // closed does not resolve before the port is free
   await sleep(20);
@@ -366,29 +417,33 @@ test('the server stops itself after idleMs with no POST /expand', async t => {
 
 test('a POST /expand that passes the origin checks resets the idle timer', async t => {
   const { dir } = seeded(t);
-  const idleMs = 600;
+  const idleMs = 1000; // the POST has to land before this runs out: 750 ms of room, however slow the machine is
   const server = await start(t, dir, { idleMs });
   await sleep(250);
-  const sentAt = performance.now();
+  const sentAt = performance.now(); // before the POST goes out, so the server has not yet reset its timer
   assert.equal((await post(server.url, DETAIL)).status, 202);
   assert.equal(await server.closed, 'idle');
-  // Without the reset the server would have closed about 350 ms after the POST.
+  // Without the reset the server would have closed about 750 ms after the POST.
   assert.ok(performance.now() - sentAt >= idleMs - 20, `closed ${Math.round(performance.now() - sentAt)} ms after the POST`);
 });
 
 test('requests that fail the origin checks, and plain GETs, do not reset the idle timer', async t => {
+  // Two servers start together with the same idleMs. Only the first is sent the requests below. If one of them reset its timer
+  // the first would stop 300 ms after the second; a slow machine delays both stops by the same amount, so the two are compared
+  // with each other and not with the clock.
   const { dir } = seeded(t);
   const idleMs = 1000;
-  const server = await start(t, dir, { idleMs });
-  await sleep(500);
-  const sentAt = performance.now();
-  assertRefused(await post(server.url, DETAIL, { ...AS_JSON, Origin: 'https://evil.example' }), 403);
-  assertRefused(await post(server.url, '{}', { ...AS_JSON, Host: 'evil.example' }), 403);
-  assert.equal((await fetch(`${server.url}/map.json`)).status, 200);
-  assert.equal((await fetch(`${server.url}/`)).status, 200);
-  assert.equal(await server.closed, 'idle');
-  // Had one of them reset it, the server would have lived until 1000 ms after them.
-  assert.ok(performance.now() - sentAt < 800, `closed ${Math.round(performance.now() - sentAt)} ms after them`);
+  const [touched, untouched] = await Promise.all([start(t, dir, { idleMs }), start(t, dir, { idleMs })]);
+  const stoppedAt = server => server.closed.then(reason => ({ reason, at: performance.now() }));
+  const stops = Promise.all([stoppedAt(touched), stoppedAt(untouched)]);
+  await sleep(300);
+  assertRefused(await post(touched.url, DETAIL, { ...AS_JSON, Origin: 'https://evil.example' }), 403);
+  assertRefused(await post(touched.url, '{}', { ...AS_JSON, Host: 'evil.example' }), 403);
+  assert.equal((await fetch(`${touched.url}/map.json`)).status, 200);
+  assert.equal((await fetch(`${touched.url}/`)).status, 200);
+  const [first, second] = await stops;
+  assert.deepEqual([first.reason, second.reason], ['idle', 'idle']);
+  assert.ok(first.at - second.at < 150, `the server that was sent the requests stopped ${Math.round(first.at - second.at)} ms after the other`);
 });
 
 // ---- the map cache ----
@@ -534,6 +589,9 @@ test('/map.json and the page are sent with the documented headers', async t => {
   const page = await fetch(`${url}/`);
   assert.equal(page.headers.get('content-type'), 'text/html; charset=utf-8');
   assert.equal(page.headers.get('cache-control'), 'no-store'); // the page embeds the map, so a reload must not show an old one
+  // No other site may put the page in a frame: it could lay something over it and get a click on a direction out of the reader.
+  assert.equal(page.headers.get('content-security-policy'), "frame-ancestors 'self'");
+  assert.equal(page.headers.get('x-frame-options'), 'SAMEORIGIN');
   await page.arrayBuffer();
 });
 
@@ -640,20 +698,28 @@ test('POST /expand needs a JSON content type', async t => {
 test('POST /expand takes a body of 16 KiB and refuses one byte more', async t => {
   const { dir } = seeded(t);
   const { url } = await start(t, dir);
-  // A body of exactly this many bytes: a question padded with ASCII.
-  const bodyOf = bytes => {
-    const empty = Buffer.byteLength(JSON.stringify({ nodeId: 'g-know-1', direction: 'question', question: '' }));
-    const body = JSON.stringify({ nodeId: 'g-know-1', direction: 'question', question: 'x'.repeat(bytes - empty) });
-    assert.equal(Buffer.byteLength(body), bytes);
-    return body;
-  };
-  assert.equal((await post(url, bodyOf(16 * KB))).status, 202);
-  assertRefused(await post(url, bodyOf(16 * KB + 1)), 413);
-  assertRefused(await post(url, bodyOf(1024 * KB)), 413); // the rest of a big upload is read and dropped, so the answer still arrives
+  assert.equal((await post(url, questionBody(16 * KB))).status, 202);
+  assertRefused(await post(url, questionBody(16 * KB + 1)), 413);
+  assertRefused(await post(url, questionBody(1024 * KB)), 413); // the rest of a big upload is read and dropped, so the answer still arrives
   // The limit counts bytes, not characters: 6000 Thai characters are 18000 bytes.
   assertRefused(await post(url, JSON.stringify({ ...DETAIL, direction: 'question', question: 'ก'.repeat(6000) })), 413);
   assert.equal(inboxLines(dir).length, 1); // only the first one was queued
   assert.equal((await post(url, DETAIL)).status, 202); // and the server is fine afterwards
+});
+
+test('POST /expand holds a body with no Content-Length to the same 16 KiB', async t => {
+  // A chunked body has no length to look at before it is read, so the limit has to be counted as the bytes arrive.
+  const { dir } = seeded(t);
+  const { port } = await start(t, dir);
+  const inChunks = text => text.match(/[\s\S]{1,3000}/g); // the bodies are ASCII, so this is 3000 bytes at a time
+  const small = JSON.stringify(DETAIL);
+  assert.equal((await postChunked(port, [small.slice(0, 10), small.slice(10)])).status, 202); // a small body, in two chunks
+  assert.equal((await postChunked(port, inChunks(questionBody(16 * KB)))).status, 202); // exactly 16 KiB is taken
+  assertRefused(await postChunked(port, inChunks(questionBody(16 * KB + 1))), 413); // and one byte more is not
+  assertRefused(await postChunked(port, inChunks(questionBody(1024 * KB))), 413);
+  assert.equal(inboxLines(dir).length, 2); // the small one and the one of exactly 16 KiB
+  assert.equal((await postChunked(port, [small])).status, 200); // a chunked body is deduped like any other
+  assert.equal((await post(`http://127.0.0.1:${port}`, DETAIL)).status, 200); // and the server answers as before
 });
 
 test('a request that dies in the middle of its body does not harm the server', async t => {
@@ -814,7 +880,8 @@ test('POST /expand never appends the same request twice, even when they arrive t
   assert.equal(inboxLines(dir).length, 1);
 });
 
-test('POST /expand answers 500 when the inbox cannot be written, and the server carries on', async t => {
+test('POST /expand answers 500 when the inbox cannot be read, and the server carries on', async t => {
+  // The duplicate check reads the inbox first, so a folder in place of the file stops the request there, before any append.
   const { dir } = seeded(t);
   const { url } = await start(t, dir);
   const stream = openEvents(t, url);
@@ -831,4 +898,33 @@ test('POST /expand answers 500 when the inbox cannot be written, and the server 
 
   fs.rmSync(inboxFile(dir), { recursive: true });
   assert.equal((await post(url, DETAIL)).status, 202); // and it recovers once the inbox is there again
+});
+
+test('POST /expand answers 500 when the request cannot be appended, and the server carries on', async t => {
+  // This one gets past the duplicate check and fails in appendRequest, as a read-only inbox or a full disk would.
+  const { dir } = seeded(t);
+  const { url } = await start(t, dir);
+  const stream = openEvents(t, url);
+  await opened(stream);
+  const inbox = inboxFile(dir);
+  const open = fs.openSync;
+  const refuse = t.mock.method(fs, 'openSync', (file, flags, ...rest) => {
+    if (file === inbox && flags === 'a+') throw Object.assign(new Error(`EACCES: permission denied, open '${file}'`), { code: 'EACCES' });
+    return open(file, flags, ...rest);
+  });
+  const appends = () => refuse.mock.calls.filter(call => call.arguments[0] === inbox && call.arguments[1] === 'a+').length;
+
+  const res = await post(url, DETAIL);
+  assert.equal(res.status, 500);
+  assert.match(res.headers['content-type'], /^application\/json/);
+  assert.match(res.json().error, THAI);
+  assert.match(res.json().detail, /EACCES/); // it is the append that failed, not the read before it
+  assert.equal(appends(), 1);
+  await sleep(100);
+  assert.equal(eventsNamed(stream, 'queued').length, 0); // nothing was queued, so nothing is announced
+  assert.equal((await fetch(`${url}/map.json`)).status, 200);
+
+  refuse.mock.restore();
+  assert.equal((await post(url, DETAIL)).status, 202); // and it recovers once the inbox can be opened again
+  assert.equal(inboxLines(dir).length, 1); // with nothing left over from the failed try
 });

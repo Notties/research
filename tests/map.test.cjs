@@ -682,7 +682,7 @@ test('acceptRequests skips duplicates', () => {
   assert.equal(accepted.length, 1);
 });
 
-// queueKey is the dedupe rule itself. The server imports it, so it and acceptRequests cannot drift apart.
+// queueKey is the dedupe rule of acceptRequests. (The live server dedupes by DRCore.cleanKey: this key with the question cleaned.)
 test('queueKey treats a missing, null and empty question alike and ignores id, time and status', () => {
   const detail = { nodeId: 'g-know-1', direction: 'detail' };
   assert.equal(typeof queueKey(detail), 'string');
