@@ -275,8 +275,10 @@ test('brief tells the subagent which tools to use, what to record and how to ans
 
 // The read-only agent-reach actions that rule 11 allows, as it writes them. This is the whole list: a command that is not
 // here is not allowed, and a test below checks each of these against the real agent-reach. A value that comes from a page or
-// a search result (a query, a URL) is the placeholder '<...>' in single quotes: in Bash and in PowerShell the text inside
-// single quotes stays literal. A test checks that no form uses double quotes or leaves a placeholder bare.
+// a search result (a query, a URL) is the placeholder '<...>' in single quotes. In the Bash tool the text inside single
+// quotes stays literal up to the next ASCII ', and rule 12 keeps a quotation mark of any kind out of a value (Windows
+// PowerShell also ends a single-quoted string at a curly single quote, so agent-reach is never run there). A test checks
+// that no form, in any of the five documents, uses double quotes or leaves a placeholder bare.
 //
 // Only the user changes this list. The assembling Claude and the subagents never do, and the documents do not say how.
 // To widen it, the user adds a command to rule 11 of references/subagent-brief.md and to this list. It must be a read-only
@@ -298,6 +300,19 @@ const AGENT_REACH_ALLOWED = [
 // test, and spend a speech-to-text quota. None of it may appear in an allowed command.
 const AGENT_REACH_CHANGES = ['add', 'remove', 'login', 'logout', 'setup', 'update', 'configure', 'uninstall', 'skill', 'browser', 'check', 'transcribe'];
 
+// The character rule of rule 12: what a value that came from a page or a search result (a query, a URL) may hold when it goes
+// to agent-reach. It is a positive list, so that a character nobody thought of is refused. A quotation mark of any kind is
+// not on it. Bash ends a single-quoted string at ' only, but Windows PowerShell also ends it at the curly single quotes
+// U+2018 to U+201B (common in page text: the apostrophe of Don't is often U+2019) and then runs what follows. The vowels and
+// tone marks of Thai are marks (\p{M}), not letters, so the list takes marks as well as letters and numbers, or most Thai
+// words would be refused.
+const ALLOWED_URL_MARKS = ['-', '.', '_', '~', ':', '/', '?', '#', '[', ']', '@', '&', '(', ')', '*', '+', ',', ';', '=', '%'];
+const fromCodes = (...codes) => codes.map(code => String.fromCodePoint(code)); // built from code points, so that this file holds no invisible character and no curly quote itself
+const CURLY_SINGLE_QUOTES = fromCodes(0x2018, 0x2019, 0x201a, 0x201b); // PowerShell ends a single-quoted string at each of these
+const QUOTES_REFUSED = ["'", '"', ...CURLY_SINGLE_QUOTES, ...fromCodes(0x201c, 0x201d, 0x201e)];
+const ARGUMENT_OK = new RegExp(`^[\\p{L}\\p{M}\\p{N} ${ALLOWED_URL_MARKS.map(c => (/[\]\\^-]/.test(c) ? `\\${c}` : c)).join('')}]+$`, 'u');
+const codePoint = c => `U+${c.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')}`;
+
 const templateLines = () => template().split('\n');
 function templateSection(heading) {
   const lines = templateLines();
@@ -312,6 +327,8 @@ function rule(n) {
   return line;
 }
 const agentReachCommands = text => [...text.matchAll(/`(agent-reach [^`]+)`/g)].map(m => m[1]);
+// Every backticked span of a document that holds agent-reach: a command, or just the name.
+const agentReachSpans = text => [...text.matchAll(/`([^`\n]*agent-reach[^`\n]*)`/g)].map(m => m[1]);
 // A form hands what a page or a search result gave to the shell in single quotes: no double quote (inside which $(...) and
 // $VAR are still expanded) and no placeholder left bare (which the shell cuts at ; & | ( ) and runs the rest).
 function assertSafelyQuoted(form, where) {
@@ -340,36 +357,108 @@ test('brief rule 11 allows the read-only agent-reach actions it lists, and nothi
   const r11 = rule(11);
   assert.deepEqual(agentReachCommands(r11).sort(), [...AGENT_REACH_ALLOWED].sort(), 'rule 11 lists exactly the allowed commands');
   for (const word of [
-    'Bash', 'PowerShell', 'อ่านอย่างเดียว', 'ไม่มีอย่างอื่น', 'ready', // the shell is for the list only, and a channel must be ready
+    // the shell is for the list only, and only the Bash tool (rule 12 says why), and a channel must be ready
+    'เครื่องมือ shell ใช้ได้เฉพาะเรียก `agent-reach` แบบอ่านอย่างเดียวตามรายการนี้ และไม่มีอย่างอื่น (เครื่องมือ Bash เท่านั้น ตามข้อ 12):', 'ready',
     'เนื้อหาสาธารณะ', 'repo ส่วนตัว', // public content only
     // read only with --backend public-web: without it agent-reach picks the channel from the URL, and a channel such as bilibili
     // reads with a saved login. When the flagged form fails, WebFetch is used and never the form without the flag.
     '`read` ใช้ได้เฉพาะรูปที่มี `--backend public-web` เสมอ', 'bilibili', 'เซสชัน', 'ให้เปิด URL นั้นด้วย WebFetch แทน', 'หรือเลิกใช้แหล่งนั้น', 'ห้ามใช้ `read` แบบไม่มีแฟล็กเด็ดขาด',
-    'ตามข้อ 12', // the values go in as rule 12 says
+    "(แทนค่าใน `'<...>'` ตามข้อ 12)", // the values go in as rule 12 says: the whole pointer, since the opener above also says "ตามข้อ 12"
     '`transcribe`', // it spends a Whisper quota and downloads audio
     '(เช่น add, remove, login, logout, setup, update, configure, uninstall, skill, browser, check)', // the other subcommands
     'ห้ามรันคำสั่งอื่นทุกชนิด', 'ห้ามติดตั้งหรืออัปเดต', 'ห้ามล็อกอิน', 'รหัสผ่าน', 'โทเคน', 'API key', 'ห้ามสร้างบัญชี', 'ห้ามดาวน์โหลดไฟล์',
   ]) assert.ok(r11.includes(word), `rule 11: ${word}`);
 });
 
-test('brief rule 12: a query or a URL goes in single quotes, and the characters that break out of them are forbidden', () => {
+test('brief rule 12: agent-reach runs in the Bash tool only, an argument goes in single quotes, and only the characters of a positive list may be in it', () => {
   const r12 = rule(12);
   for (const word of [
-    "ต้องอยู่ในเครื่องหมายคำพูดเดี่ยว `'...'` เสมอ", // the instruction itself, not just the words "single quotes"
-    'เครื่องหมายคำพูดเดี่ยว', 'Bash และ PowerShell', // single quotes are literal in both shells
-    '`$(...)`', 'backtick', '`$VAR`', // double quotes still expand these
-    '`;`, `&`, `|`, `(` และ `)`', // an unquoted URL is cut at these and the rest runs as another command
-    "`'`, `\"`, `\\` หรือขึ้นบรรทัดใหม่", 'ให้เปิด URL นั้นด้วย WebFetch แทน', // an argument that holds one of these is never passed
-    '`http://` หรือ `https://`', 'ไม่ใช้ id หรือ owner/repo เปล่า', 'ไม่ขึ้นต้นด้วย `-`', // a URL starts like a URL, a query is not an option
+    // 1. The Bash tool only, and why in one clause: PowerShell ends a single-quoted string at the curly single quotes as well
+    // as at ', and then runs what follows, while Bash ends it at the plain ' alone.
+    'รัน `agent-reach` ผ่านเครื่องมือ Bash เท่านั้น ห้ามรันผ่าน PowerShell',
+    `เพราะใน PowerShell เครื่องหมายคำพูดเดี่ยวแบบโค้ง \`${CURLY_SINGLE_QUOTES.join(' ')}\` ปิดข้อความได้เหมือน \`'\` แล้วข้อความหลังจุดนั้นถูกรันเป็นคำสั่ง`,
+    "ส่วนใน Bash มีแต่ `'` ธรรมดาที่ปิดข้อความ",
+    // 2. Single quotes, the ASCII ones: the instruction itself, not just the words "single quotes". Why not double quotes, and
+    // what an unquoted URL does.
+    "ต้องอยู่ในเครื่องหมายคำพูดเดี่ยว `'...'` แบบ ASCII เสมอ",
+    '`$(...)`, backtick และ `$VAR` ยังถูกแปลงเป็นคำสั่งหรือค่า',
+    '`;`, `&`, `|`, `(` และ `)` ทำให้ข้อความหลังจุดนั้นกลายเป็นคำสั่งอื่น',
+    // 3. The positive list. Its marks are compared with the regex below.
+    'มีอักขระได้เฉพาะตัวอักษรและตัวเลขของทุกภาษา (รวมสระและวรรณยุกต์ที่ประกอบกับตัวอักษร) ช่องว่าง ASCII ธรรมดา และเครื่องหมาย URL เหล่านี้เท่านั้น:',
+    // 4. Anything else is refused, whatever it is, and what to do instead. The quotation marks are compared with the regex below.
+    'ถ้ามีอักขระอื่นแม้ตัวเดียว ห้ามส่งอาร์กิวเมนต์นั้น',
+    'เครื่องหมายคำพูดทุกแบบ ทั้งตรงและโค้ง',
+    QUOTES_REFUSED.at(-1) + '` และแบบอื่น)',
+    'แบ็กสแลช backtick `$` การขึ้นบรรทัดใหม่ และอักขระควบคุมอื่น',
+    'ให้ย่อคำค้นให้ไม่เหลืออักขระนั้น เข้ารหัส URL แบบ percent-encoding หรือให้เปิด URL นั้นด้วย WebFetch แทน',
+    // 5. A URL starts like a URL, and a query is not an option.
+    'ต้องขึ้นต้นด้วย `http://` หรือ `https://` ใช้ลิงก์เต็มเสมอ', 'ไม่ใช้ id หรือ owner/repo เปล่า', 'และคำค้นต้องไม่ขึ้นต้นด้วย `-`',
   ]) assert.ok(r12.includes(word), `rule 12: ${word}`);
+  assert.ok(!r12.includes('Bash และ PowerShell'), 'rule 12 no longer says that a single-quoted string stays literal in both shells');
 });
 
-test('no form of the whitelist uses double quotes or leaves a placeholder bare', () => {
+test('rule 12 lists exactly the URL marks and the quotation marks that the character rule below is built from', () => {
+  const r12 = rule(12);
+  const marks = /เครื่องหมาย URL เหล่านี้เท่านั้น: `([^`]+)`/.exec(r12);
+  assert.ok(marks, 'rule 12 lists the URL marks after "เครื่องหมาย URL เหล่านี้เท่านั้น:"');
+  assert.deepEqual(marks[1].split(' ').sort(), [...ALLOWED_URL_MARKS].sort(), 'the marks of rule 12 are the marks of the regex, no more and no fewer');
+  const quotes = /ทั้งตรงและโค้ง \(`([^`]+)`/.exec(r12);
+  assert.ok(quotes, 'rule 12 lists the quotation marks it refuses, straight and curly');
+  assert.deepEqual(quotes[1].split(' ').sort(), [...QUOTES_REFUSED].sort(), 'rule 12 names exactly these quotation marks');
+  for (const mark of ALLOWED_URL_MARKS) assert.ok(!QUOTES_REFUSED.includes(mark), `${mark} is a URL mark and not a quotation mark`);
+});
+
+test('the character rule of rule 12, as a regex, refuses every quotation mark and what breaks out of single quotes, and accepts what a query or a URL holds', () => {
+  const inside = c => `https://x.example/a${c}b`;
+  const refused = [
+    ...QUOTES_REFUSED, // the ASCII single and double quote, the four curly single quotes (U+2018 to U+201B) and the three curly double quotes
+    '\\', '`', '$', // backslash, backtick and dollar sign
+    '\n', '\r', '\t', '\v', '\f', '\0', ...fromCodes(0x85, 0x2028, 0x2029), // line breaks and other control characters
+    '|', '<', '>', '{', '}', '!', '^', // shell syntax that no URL needs
+    ...fromCodes(0xa0, 0x200b, 0xfeff), // a space that is not the ASCII space, and invisible characters
+    ...fromCodes(0x2013, 0x2014, 0xff07, 0xb4, 0x2032), // dashes, a full-width apostrophe, an accent and a prime: harmless today, refused all the same
+  ];
+  for (const c of refused) {
+    assert.ok(!ARGUMENT_OK.test(inside(c)), `${codePoint(c)} in a URL must be refused`);
+    assert.ok(!ARGUMENT_OK.test(`ค้นหา${c}ข้อมูล`), `${codePoint(c)} in a Thai query must be refused`);
+  }
+  // The probe of the review: a curly quote ends the string in Windows PowerShell, what follows runs, and # drops the fixed flag.
+  for (const quote of [...CURLY_SINGLE_QUOTES, "'"]) {
+    const payload = `https://x.example/p${quote}; Write-Output INJECTED #`;
+    assert.ok(!ARGUMENT_OK.test(payload), `the payload with ${codePoint(quote)} must be refused`);
+  }
+  assert.ok(!ARGUMENT_OK.test(`Don${CURLY_SINGLE_QUOTES[1]}t stop believing`), 'a plain query with a curly apostrophe is refused, and has to be shortened');
+
+  const thai = 'ปัญญาประดิษฐ์ ในการแพทย์ 2025';
+  assert.ok(/\p{Mn}/u.test(thai), 'the Thai sample holds vowel and tone marks, which are marks and not letters');
+  for (const ok of [
+    thai, 'react server components 2025', 'ภาษา Rust vs Go',
+    `Thai digits ๑๒๓, Japanese ${fromCodes(0x65e5, 0x672c, 0x8a9e).join('')} and Arabic ${fromCodes(0x627, 0x644, 0x639, 0x631, 0x628, 0x64a, 0x629).join('')}`, // letters and digits of other scripts
+    'https://en.wikipedia.org/wiki/Rust_(programming_language)', // ( and ) in a URL
+    'https://x.example/a?b=c&d=e#f', // ? = & #
+    'https://x.example/a%20b%E2%80%99s', // %: a URL with a curly apostrophe, percent-encoded
+    'https://th.wikipedia.org/wiki/ปัญญาประดิษฐ์',
+    'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
+    'https://github.com/owner/repo/issues/12',
+    'https://x.example/a;b,c+d*e~f@g[h]i=j_k-l.m:n',
+  ]) assert.ok(ARGUMENT_OK.test(ok), `must be accepted: ${ok}`);
+  for (const mark of ALLOWED_URL_MARKS) assert.ok(ARGUMENT_OK.test(`a${mark}b`), `the URL mark ${mark} must be accepted`);
+  assert.ok(ARGUMENT_OK.test('a b'), 'the ASCII space is accepted');
+});
+
+test('no form of the whitelist uses double quotes or leaves a placeholder bare, in any of the five documents', () => {
   assert.ok(AGENT_REACH_ALLOWED.filter(form => form.includes("'<")).length >= 6, 'the forms that take a query or a URL');
   for (const form of AGENT_REACH_ALLOWED) assertSafelyQuoted(form, 'AGENT_REACH_ALLOWED');
-  const named = agentReachCommands(template());
-  assert.ok(named.some(command => command.includes("'<")), 'the template shows a form with a quoted placeholder');
-  for (const command of named) assertSafelyQuoted(command, 'the template');
+  // Every backticked span that holds agent-reach, in all five documents and not only in the template.
+  let seen = 0;
+  for (const name of DOCS) {
+    for (const span of agentReachSpans(doc(name))) {
+      seen += 1;
+      assertSafelyQuoted(span, name);
+    }
+  }
+  assert.ok(seen >= AGENT_REACH_ALLOWED.length, 'the documents show the commands they allow');
+  assert.ok(agentReachCommands(template()).some(command => command.includes("'<")), 'the template shows a form with a quoted placeholder');
 });
 
 test('every agent-reach command the template names is on the list of rule 11, and none of them can change anything', () => {
@@ -434,6 +523,9 @@ test('brief tells the browser to pass the tabId on every call, read only, in a t
     'ห้ามคลิก', 'ห้ามพิมพ์', 'ห้ามกรอกฟอร์ม', 'ห้ามล็อกอิน', 'แบนเนอร์', '`computer`', '`form_input`', '`javascript_tool`', // read only
     // Its own tab, opened by the subagent and closed by it with the same id. "ปิดแท็บ" alone would be found in "เปิดแท็บ" too.
     'เปิดแท็บของตัวเอง (`tabs_create`)', 'ปิดแท็บของตัวเองด้วย `tabs_close` พร้อม `tabId`', 'ห้ามปิดแท็บของคนอื่น',
+    // The browser may hold a login of the user's. A page that shows a signed-in state (an account name, personal data) is closed
+    // at once and its source is dropped. The whole sentence: "ปิดแท็บ" alone would be found in "เปิดแท็บ" too.
+    'ถ้าหน้าที่เปิดแสดงในสถานะที่ล็อกอินอยู่ (เช่น เห็นชื่อบัญชีหรือข้อมูลส่วนตัว) ให้ปิดแท็บนั้นทันทีและเลิกใช้แหล่งนั้น',
   ]) assert.ok(paragraph.includes(word), `the browser paragraph: ${word}`);
 });
 
